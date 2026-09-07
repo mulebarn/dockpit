@@ -11,6 +11,7 @@ DOCKPIT is a Textual terminal UI for monitoring and updating Docker containers. 
 - Preserve supported container configuration during recreation.
 - Make update progress, partial failure, and retry behavior visible.
 - Keep the project small, testable, and usable from a clean checkout.
+- Make operational priority legible at a glance: attention states first, current resource load second, metadata and history on demand.
 
 ## Non-goals for the initial phases
 
@@ -178,6 +179,19 @@ Current progress:
 - Added metadata tests for healthy and unhealthy states.
 - Added read-only `i` inspect action that formats selected-container metadata in the log pane.
 - Added direct JSON-formatting coverage for inspect output.
+
+### UX pass: operational hierarchy
+
+**Status:** In progress
+
+The current UI hierarchy is ordered by impact and implementation cost:
+
+1. Selected-row contrast, explicit health/update labels, CPU/MEM micro-bars, and update highlighting.
+2. Timestamped Recent Actions, grouped shortcut labels, and `!` Attention Mode for stopped, unhealthy, update-ready, failed, or high-load containers.
+3. Details enrichment with image reference, update state, age, start time, networks, volume count, and rolling resource trends.
+4. Derived service-oriented filtering through name/image matching. True collapsible group-header rows remain deferred because the current table's actionable identity is a Docker container ID; introducing non-container rows would require a selection and action-model change.
+
+The implementation keeps Docker container identity as the single source of truth, with visual priority derived from health, lifecycle, update, failure, and resource state. Background workers continue to update the derived view through the existing generation and in-flight guards.
 - Added confirmed pause and remove lifecycle actions with headless integration coverage.
 - Added bounded CPU and memory resource history with compact detail-panel sparklines.
 - Added direct coverage for history pruning and per-container update-all results.
@@ -275,6 +289,8 @@ Current progress:
 - Added fake-client coverage for daemon disconnects and registry outages.
 - Stats and registry polling intervals are configurable through `DOCKPIT_STATS_INTERVAL` and `DOCKPIT_REGISTRY_INTERVAL`, defaulting to 2 and 60 seconds.
 - Resource history and per-container update-all results are covered by headless tests.
+- The header shows a live elapsed timer while Docker stats collection is in flight.
+- Stats collection reads the first decoded item from a short-lived Docker stats stream and closes it deterministically.
 - `PYTHONPATH=. .venv/bin/python tests/test_app.py` passes.
 
 Remaining:

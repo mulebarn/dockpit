@@ -5,7 +5,7 @@ Screen {
 }
 
 #app-header {
-    height: auto;
+    height: 5;
     background: #3c3836;
     border-bottom: heavy #504945;
     padding: 0 1;
@@ -14,9 +14,22 @@ Screen {
 #app-title {
     color: #fe8019;
     text-style: bold;
+    height: 1;
     content-align: left middle;
+    padding: 0 1;
+}
+
+#app-subtitle {
+    color: #fabd2f;
+    height: 1;
+    text-style: bold;
+    padding: 0 1;
+}
+
+#header-controls {
+    height: 2;
     width: 1fr;
-    padding: 0 0 0 1;
+    align: left middle;
 }
 
 #container-filter {
@@ -39,8 +52,16 @@ Screen {
     color: #b8bb26;
     text-style: bold;
     content-align: right middle;
-    width: auto;
+    width: 1fr;
     padding: 0 3 0 1;
+}
+
+#attention-banner {
+    display: none;
+    color: #fb4934;
+    text-style: bold;
+    width: auto;
+    padding: 0 1;
 }
 
 #main {
@@ -59,15 +80,15 @@ Screen {
     color: #ebdbb2;
 }
 
+#containers > .datatable--cursor {
+    background: #fabd2f;
+    color: #1d2021;
+    text-style: bold reverse;
+}
+
 #containers > .datatable--header {
     background: #3c3836;
     color: #fabd2f;
-    text-style: bold;
-}
-
-#containers > .datatable--cursor {
-    background: #504945;
-    color: #ebdbb2;
     text-style: bold;
 }
 

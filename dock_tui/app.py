@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone
 
 import docker
@@ -11,7 +12,9 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.command import Hit, Matcher, Provider
 from textual.containers import Horizontal, Vertical
+from textual.events import Resize
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Input, RichLog, Static
 
@@ -30,33 +33,56 @@ MAX_LOG_HISTORY = 5000
 MAX_RESOURCE_HISTORY = 30
 DEFAULT_STATS_INTERVAL = 2.0
 DEFAULT_REGISTRY_INTERVAL = 60.0
+DEFAULT_REGISTRY_CACHE_TTL = 900.0
+MAX_REGISTRY_BACKOFF = 1800.0
 
 STATUS_DISPLAY = {
-    "running": ("\u25cf running", GRUVBOX_GREEN),
-    "exited": ("\u25a0 stopped", GRUVBOX_RED),
-    "dead": ("\u25a0 dead", GRUVBOX_RED),
-    "created": ("\u25a3 created", GRUVBOX_YELLOW),
-    "paused": ("\u23f8 paused", GRUVBOX_AQUA),
+    "running": ("\u25cf Running", GRUVBOX_GREEN),
+    "exited": ("\u25a0 Stopped", GRUVBOX_RED),
+    "dead": ("\u25a0 Dead", GRUVBOX_RED),
+    "created": ("\u25a3 Created", GRUVBOX_YELLOW),
+    "paused": ("\u23f8 Paused", GRUVBOX_AQUA),
+}
+STATUS_COMPACT = {
+    "running": "\u25cf",
+    "exited": "\u25a0",
+    "dead": "\u25a0",
+    "created": "\u25a3",
+    "paused": "\u23f8",
 }
 
 UPDATE_DISPLAY = {
-    "update": ("\u25b2 update avail", GRUVBOX_ORANGE),
-    "up-to-date": ("\u2714 current", GRUVBOX_GREEN),
-    "local": ("\u00b7 local only", GRUVBOX_GRAY),
-    "registry-error": ("! registry error", GRUVBOX_RED),
-    "unknown": ("? unknown", GRUVBOX_GRAY),
-    "updating": ("\u21bb updating", GRUVBOX_AQUA),
-    "pulling": ("\u21bb pulling", GRUVBOX_AQUA),
-    "stopping": ("\u25a0 stopping", GRUVBOX_YELLOW),
-    "removing": ("\u2212 removing", GRUVBOX_YELLOW),
-    "recreating": ("\u21bb recreating", GRUVBOX_AQUA),
-    "restoring": ("\u21b3 networks", GRUVBOX_AQUA),
-    "recovered": ("\u21ba recovered", GRUVBOX_YELLOW),
-    "degraded": ("\u26a0 degraded", GRUVBOX_ORANGE),
-    "failed": ("\u2716 failed", GRUVBOX_RED),
+    "update": ("\u25b2 Update Available", GRUVBOX_ORANGE),
+    "up-to-date": ("\u2713 Current", GRUVBOX_GREEN),
+    "local": ("LOCAL ONLY", GRUVBOX_GRAY),
+    "registry-error": ("REGISTRY ERROR", GRUVBOX_RED),
+    "unknown": ("? Unknown", GRUVBOX_YELLOW),
+    "updating": ("\u21bb Updating", GRUVBOX_AQUA),
+    "pulling": ("\u21bb Pulling", GRUVBOX_AQUA),
+    "stopping": ("\u21bb Stopping", GRUVBOX_YELLOW),
+    "removing": ("\u2212 Removing", GRUVBOX_YELLOW),
+    "recreating": ("\u21bb Recreating", GRUVBOX_AQUA),
+    "restoring": ("\u21bb Restoring Networks", GRUVBOX_AQUA),
+    "recovered": ("\u21ba Recovered", GRUVBOX_YELLOW),
+    "degraded": ("! Degraded", GRUVBOX_ORANGE),
+    "failed": ("\u2716 Failed", GRUVBOX_RED),
 }
-UPDATE_GLYPH = {key: value[0].split()[0] for key, value in UPDATE_DISPLAY.items()}
-UPDATE_COLOR = {key: value[1] for key, value in UPDATE_DISPLAY.items()}
+UPDATE_COMPACT = {
+    "update": "\u25b2",
+    "up-to-date": "\u2713",
+    "updating": "\u21bb",
+    "unknown": "?",
+    "pulling": "\u21bb",
+    "stopping": "\u21bb",
+    "removing": "\u2212",
+    "recreating": "\u21bb",
+    "restoring": "\u21bb",
+    "recovered": "\u21ba",
+    "degraded": "!",
+    "failed": "\u2716",
+    "local": "\u00b7",
+    "registry-error": "!",
+}
 
 DETAIL_IDS = (
     "d-name",
@@ -67,12 +93,15 @@ DETAIL_IDS = (
     "d-ports",
     "d-stats",
     "d-update",
+    "d-restart-time",
+    "d-network",
+    "d-volumes",
 )
 
 HEALTH_DISPLAY = {
     "healthy": ("\u2714 healthy", GRUVBOX_GREEN),
     "unhealthy": ("\u2716 unhealthy", GRUVBOX_RED),
-    "starting": ("\u21bb starting", GRUVBOX_YELLOW),
+    "starting": ("? unknown", GRUVBOX_YELLOW),
 }
 
 
@@ -114,26 +143,71 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(event.button.id == "accept-confirm")
 
 
+class DockPitCommandProvider(Provider):
+    """Searchable command discovery for actions that are not footer bindings."""
+
+    async def discover(self):
+        for _score, label, action, help_text, _aliases in self._commands():
+            yield Hit(0.0, label, action, help=help_text)
+
+    async def search(self, query: str):
+        query = query.strip().lower()
+        matcher = Matcher(query)
+        for score, label, action, help_text, aliases in self._commands():
+            haystack = f"{label} {help_text} {' '.join(aliases)}".lower()
+            if not query:
+                yield Hit(0.0, label, action, help=help_text)
+            else:
+                match_score = matcher.match(haystack)
+                if match_score > 0:
+                    yield Hit(match_score, label, action, help=help_text)
+
+    def _commands(self):
+        app = self.app
+        return (
+            (0.0, "Start selected container", app.action_start_selected, "start lifecycle", ("run", "up")),
+            (0.0, "Stop selected container", app.action_stop_selected, "stop lifecycle", ("halt", "down")),
+            (0.0, "Restart selected container", app.action_restart_selected, "restart lifecycle", ("reboot",)),
+            (0.0, "Pause selected container", app.action_pause_selected, "pause lifecycle", ("suspend",)),
+            (0.0, "Remove selected container", app.action_remove_selected, "remove lifecycle", ("delete",)),
+            (0.0, "Update selected container", app.action_update_selected, "update one image", ("upgrade",)),
+            (0.0, "Update all available containers", app.action_update_all, "update every candidate", ("upgrade all",)),
+            (0.0, "Toggle Attention Mode", app.action_toggle_attention, "attention alerts failures load", ("attention", "alerts")),
+            (0.0, "Expand container groups", app.action_expand_groups, "group expand services", ("groups", "services")),
+            (0.0, "Collapse container groups", app.action_collapse_groups, "group collapse services", ("groups", "services")),
+            (0.0, "Show recent logs", app.action_logs_selected, "logs recent", ("log",)),
+            (0.0, "Follow logs", app.action_logs_follow, "logs follow stream", ("log", "tail")),
+            (0.0, "Filter containers", app.action_focus_filter, "filter containers", ("search",)),
+            (0.0, "Filter logs", app.action_focus_log_filter, "filter log output", ("search",)),
+            (0.0, "Inspect selected container", app.action_inspect_selected, "inspect metadata", ("details",)),
+            (0.0, "Refresh containers", app.action_rescan, "rescan refresh", ("reload",)),
+            (0.0, "Show registry settings", app.action_show_registry_settings, "settings registry cache ttl", ("settings", "configuration")),
+        )
+
+
 class DockerTUI(App):
     """btop/htop-inspired Docker container TUI in a vintage terminal palette."""
 
     TITLE = "DOCKPIT"
     CSS_PATH = "app.tcss"
 
+    COMMANDS = {DockPitCommandProvider}
     BINDINGS = [
-        Binding("u", "update_selected", "Update"),
-        Binding("U", "update_all", "Update all"),
         Binding("s", "start_selected", "Start"),
         Binding("d", "stop_selected", "Stop"),
-        Binding("p", "pause_selected", "Pause"),
-        Binding("R", "restart_selected", "Restart"),
-        Binding("x", "remove_selected", "Remove"),
+        Binding("p", "pause_selected", "Pause", show=False),
+        Binding("R", "restart_selected", "Restart", show=False),
+        Binding("x", "remove_selected", "Remove", show=False),
+        Binding("u", "update_selected", "Update"),
+        Binding("U", "update_all", "Update all", show=False),
         Binding("l", "logs_selected", "Logs"),
-        Binding("L", "logs_follow", "Follow logs"),
-        Binding("/", "focus_filter", "Filter"),
-        Binding("f", "focus_log_filter", "Log filter"),
-        Binding("i", "inspect_selected", "Inspect"),
+        Binding("L", "logs_follow", "Follow logs", show=False),
+        Binding("/", "focus_filter", "Filter containers", show=False),
+        Binding("f", "focus_log_filter", "Filter logs", show=False),
+        Binding("!", "toggle_attention", "Attention"),
+        Binding("i", "inspect_selected", "Inspect", show=False),
         Binding("r", "rescan", "Refresh"),
+        Binding("ctrl+p", "command_palette", "Commands"),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -152,11 +226,14 @@ class DockerTUI(App):
         self._recent_update_status: dict[str, str] = {}
         self._update_outcomes: dict[str, str] = {}
         self._filter_text = ""
+        self._attention_mode = False
         self._all_containers: list = []
         self._log_following = False
         self._log_filter_text = ""
         self._log_history: list[tuple[str, str]] = []
+        self._recent_actions: list[tuple[str, str, str]] = []
         self._stats_in_flight = False
+        self._stats_started_at: float | None = None
         self._check_in_flight = False
         self._scan_generation = 0
         self._docker_state = "starting"
@@ -166,6 +243,15 @@ class DockerTUI(App):
         self._registry_interval = self._read_interval(
             "DOCKPIT_REGISTRY_INTERVAL", DEFAULT_REGISTRY_INTERVAL
         )
+        self._registry_cache_ttl = self._read_interval(
+            "DOCKPIT_REGISTRY_CACHE_TTL", DEFAULT_REGISTRY_CACHE_TTL
+        )
+        self._registry_cache: dict[str, tuple[float, str]] = {}
+        self._registry_cooldown_until = 0.0
+        self._registry_backoff = 60.0
+        self._registry_status = ""
+        self._registry_notice_at = 0.0
+        self._groups_expanded = True
 
     @staticmethod
     def _read_interval(name: str, default: float) -> float:
@@ -176,11 +262,16 @@ class DockerTUI(App):
         return value if value > 0 else default
 
     def compose(self) -> ComposeResult:
-        yield Horizontal(
-            Static("D O C K P I T", id="app-title"),
-            Input(placeholder="filter containers", id="container-filter"),
-            Input(placeholder="filter logs", id="log-filter"),
-            Static("starting\u2026", id="container-stats"),
+        yield Vertical(
+            Static("DOCKPIT", id="app-title"),
+            Static("DOCKER OPS / LIVE", id="app-subtitle"),
+            Horizontal(
+                Input(placeholder="filter containers", id="container-filter"),
+                Input(placeholder="filter logs", id="log-filter"),
+                Static("starting\u2026", id="container-stats"),
+                Static("", id="attention-banner"),
+                id="header-controls",
+            ),
             id="app-header",
         )
         yield Horizontal(
@@ -197,6 +288,9 @@ class DockerTUI(App):
                 Static("", id="d-ports", classes="detail-row"),
                 Static("", id="d-stats", classes="detail-row"),
                 Static("", id="d-update", classes="detail-row"),
+                Static("", id="d-restart-time", classes="detail-row"),
+                Static("", id="d-network", classes="detail-row"),
+                Static("", id="d-volumes", classes="detail-row"),
                 id="details",
             ),
             id="main",
@@ -218,6 +312,7 @@ class DockerTUI(App):
         self.table.add_column("CPU", key="cpu", width=8)
         self.table.add_column("MEM", key="mem", width=8)
         self.table.add_column("UPD", key="upd", width=5)
+        self._configure_semantic_columns()
         self.push_log("Welcome to DOCKPIT.", f"bold {GRUVBOX_YELLOW}")
         try:
             self.client = docker.from_env(timeout=30)
@@ -239,6 +334,7 @@ class DockerTUI(App):
         self._request_scan()
         self.table.focus()
         self._interval_handles.append(self.set_interval(self._stats_interval, self._on_stats_timer))
+        self._interval_handles.append(self.set_interval(0.5, self._refresh_stats_wait))
         self._interval_handles.append(self.set_interval(self._registry_interval, self._on_update_check_timer))
 
     # --- shutdown ----------------------------------------------------------
@@ -266,19 +362,24 @@ class DockerTUI(App):
     def push_log(self, message: str, style: str = "") -> None:
         if self._quitting:
             return
+        timestamp = datetime.now().strftime("%H:%M:%S")
         self._log_history.append((message, style))
+        self._recent_actions.append((timestamp, message, style))
+        if len(self._recent_actions) > MAX_LOG_HISTORY:
+            del self._recent_actions[: len(self._recent_actions) - MAX_LOG_HISTORY]
         if len(self._log_history) > MAX_LOG_HISTORY:
             del self._log_history[: len(self._log_history) - MAX_LOG_HISTORY]
         if self.output is None:
             return
         if self._thread_id == threading.get_ident():
-            self._write_log(message, style)
+            self._write_log(message, style, timestamp)
         else:
-            self.call_from_thread(self._write_log, message, style)
+            self.call_from_thread(self._write_log, message, style, timestamp)
 
-    def _write_log(self, message: str, style: str = "") -> None:
+    def _write_log(self, message: str, style: str = "", timestamp: str | None = None) -> None:
         if self._log_matches_filter(message):
-            self.output.write(Text(message, style=style))
+            stamp = timestamp or datetime.now().strftime("%H:%M:%S")
+            self.output.write(Text(f"{stamp}  {message}", style=style))
 
     @on(Input.Changed, "#log-filter")
     def _on_log_filter_changed(self, event: Input.Changed) -> None:
@@ -295,8 +396,8 @@ class DockerTUI(App):
         if self.output is None:
             return
         self.output.clear()
-        for message, style in self._log_history:
-            self._write_log(message, style)
+        for timestamp, message, style in self._recent_actions:
+            self._write_log(message, style, timestamp)
 
     # --- scanning ----------------------------------------------------------
 
@@ -374,6 +475,7 @@ class DockerTUI(App):
                 self._selected_id = containers[0].id
                 self.table.move_cursor(row=0)
         self._refresh_header()
+        self._update_attention_banner()
         self._update_check_tick()
         self._on_stats_timer()
 
@@ -383,10 +485,44 @@ class DockerTUI(App):
         if self._all_containers:
             self._populate_table(self._all_containers, remember=False)
 
+    def action_toggle_attention(self) -> None:
+        self._attention_mode = not self._attention_mode
+        self._update_attention_banner()
+        self._populate_table(self._all_containers, remember=False)
+
+    def action_expand_groups(self) -> None:
+        self._groups_expanded = True
+        self.push_log("Container groups expanded.", GRUVBOX_GRAY)
+
+    def action_collapse_groups(self) -> None:
+        self._groups_expanded = False
+        self.push_log("Container groups collapsed; actionable containers remain visible.", GRUVBOX_GRAY)
+
+    def action_show_registry_settings(self) -> None:
+        self.push_log(
+            f"Registry cache: {self._registry_cache_ttl / 60:.0f}m TTL; "
+            f"poll interval: {self._registry_interval:.0f}s.",
+            GRUVBOX_GRAY,
+        )
+
+    def _update_attention_banner(self) -> None:
+        try:
+            banner = self.query_one("#attention-banner", Static)
+        except Exception:
+            return
+        if self._attention_mode:
+            banner.update("ATTENTION MODE: stopped / unhealthy / updates / failures / high load")
+            banner.styles.display = "block"
+        else:
+            banner.update("")
+            banner.styles.display = "none"
+
     def action_focus_filter(self) -> None:
         self.query_one("#container-filter", Input).focus()
 
     def _matches_filter(self, container) -> bool:
+        if self._attention_mode and not self._needs_attention(container):
+            return False
         if not self._filter_text:
             return True
         attrs = container.attrs
@@ -396,25 +532,78 @@ class DockerTUI(App):
         haystack = f"{name} {image} {status}".lower()
         return self._filter_text in haystack
 
+    def _needs_attention(self, container) -> bool:
+        status = container.status or ""
+        health = ((container.attrs.get("State") or {}).get("Health") or {}).get("Status")
+        cpu, mem = self._stats.get(container.id) or (None, None)
+        recent_failure = self._recent_update_status.get(self._name_of(container)) in {
+            "failed", "degraded", "recovered"
+        }
+        return (
+            status in {"exited", "dead", "paused"}
+            or health == "unhealthy"
+            or self._update_status.get(container.id) == "update"
+            or recent_failure
+            or (cpu is not None and cpu >= 80)
+            or (mem is not None and mem >= 80)
+        )
+
     def _add_row(self, container) -> None:
         attrs = container.attrs
         name = (container.name or container.id).lstrip("/")
         image = (attrs.get("Config") or {}).get("Image") or "?"
         status = container.status or (attrs.get("State") or {}).get("Status") or "unknown"
-        status_label, status_color = STATUS_DISPLAY.get(status, (f"? {status}", GRUVBOX_YELLOW))
-        health_text, health_color = self._health_display(attrs)
-        restart = self._restart_policy(attrs)
+        status_label = self._status_cell(status)
         health_label, health_color = self._health_display(attrs)
+        update_state = self._update_status.get(container.id, self._recent_update_status.get(name, "unknown"))
+        update_label = self._update_cell(update_state)
         self.table.add_row(
             Text(name, style=f"bold {GRUVBOX_FG}"),
-            Text(f"{status_label}", style=f"bold {status_color}"),
+            status_label,
             Text(health_label, style=f"bold {health_color}"),
-            Text("\u2013", style=GRUVBOX_GRAY),
-            Text("\u2013", style=GRUVBOX_GRAY),
-            Text("\u2013", style=GRUVBOX_GRAY),
+            self._pct_cell(None),
+            self._pct_cell(None),
+            update_label,
             key=container.id,
         )
         self._container_by_key[container.id] = container
+
+    def _configure_semantic_columns(self) -> None:
+        if self.table is None:
+            return
+        width = self.table.size.width
+        self.table.columns["status"].width = 10 if width >= 82 else 3
+        update_width = 18 if width >= 92 else 5
+        self.table.columns["upd"].width = update_width
+
+    def _status_cell(self, status: str) -> Text:
+        full_label, color = STATUS_DISPLAY.get(status, (f"? {status}", GRUVBOX_YELLOW))
+        compact = self.table is not None and self.table.columns["status"].width <= 3
+        label = STATUS_COMPACT.get(status, "?") if compact else full_label
+        return Text(label, style=f"bold {color}")
+
+    def _update_cell(self, state: str) -> Text:
+        full_label, color = UPDATE_DISPLAY.get(state, UPDATE_DISPLAY["unknown"])
+        compact = self.table is not None and self.table.columns["upd"].width <= 5
+        label = UPDATE_COMPACT.get(state, UPDATE_COMPACT["unknown"]) if compact else full_label
+        return Text(label, style=f"bold {color}")
+
+    def on_resize(self, event: Resize) -> None:
+        if self.table is None:
+            return
+        previous_width = self.table.columns["upd"].width
+        self._configure_semantic_columns()
+        if previous_width == self.table.columns["upd"].width:
+            if previous_width == self.table.columns["upd"].width:
+                for cid, container in self._container_by_key.items():
+                    status = container.status or (container.attrs.get("State") or {}).get("Status") or "unknown"
+                    self.table.update_cell(cid, "status", self._status_cell(status))
+                return
+        for cid, container in self._container_by_key.items():
+            state = self._update_status.get(cid, self._recent_update_status.get(self._name_of(container), "unknown"))
+            self.table.update_cell(cid, "upd", self._update_cell(state))
+            status = container.status or (container.attrs.get("State") or {}).get("Status") or "unknown"
+            self.table.update_cell(cid, "status", self._status_cell(status))
 
     @staticmethod
     def _health_display(attrs: dict) -> tuple[str, str]:
@@ -422,8 +611,8 @@ class DockerTUI(App):
         if state in HEALTH_DISPLAY:
             return HEALTH_DISPLAY[state]
         if (attrs.get("Config") or {}).get("Healthcheck"):
-            return "? unknown", GRUVBOX_GRAY
-        return "-", GRUVBOX_GRAY
+            return "UNKNOWN", GRUVBOX_YELLOW
+        return "NO CHECK", GRUVBOX_GRAY
 
     @staticmethod
     def _restart_policy(attrs: dict) -> str:
@@ -458,10 +647,19 @@ class DockerTUI(App):
     def _update_check_worker(self, generation: int) -> None:
         results = {}
         try:
+            by_ref = {}
             for cid, container in list(self._container_by_key.items()):
                 if self._quitting:
                     return
-                results[cid] = self._check_update(container)
+                ref = (container.attrs.get("Config") or {}).get("Image") or ""
+                by_ref.setdefault(ref, []).append(cid)
+            checked = {}
+            for ref, ids in by_ref.items():
+                if ids:
+                    checked[ref] = self._check_update(self._container_by_key[ids[0]])
+            for ref, ids in by_ref.items():
+                for cid in ids:
+                    results[cid] = checked.get(ref, "unknown")
         except Exception as exc:
             self.push_log(f"Update check failed: {exc}", f"bold {GRUVBOX_RED}")
         finally:
@@ -475,6 +673,13 @@ class DockerTUI(App):
             ref = (container.attrs.get("Config") or {}).get("Image") or ""
             if not ref or "@" in ref:
                 return "unknown"
+            now = time.monotonic()
+            cached = self._registry_cache.get(ref)
+            if cached and now - cached[0] < self._registry_cache_ttl:
+                return cached[1]
+            if now < self._registry_cooldown_until:
+                self._set_registry_status()
+                return cached[1] if cached else "unknown"
             image = None
             try:
                 image = container.image
@@ -489,23 +694,58 @@ class DockerTUI(App):
                 return "unknown"
             repo_digests = (image.attrs or {}).get("RepoDigests") or []
             if not repo_digests:
-                return "local"
+                return self._cache_registry_result(ref, "local")
             local = repo_digests[0].rsplit("@", 1)[-1]
             if not local.startswith("sha256:"):
-                return "unknown"
+                return self._cache_registry_result(ref, "unknown")
             try:
                 data = self.client.images.get_registry_data(ref)
             except Exception as exc:
-                self.push_log(f"Registry check failed for '{ref}': {exc}", GRUVBOX_YELLOW)
-                return "registry-error"
+                if self._is_rate_limited(exc):
+                    self._enter_registry_cooldown()
+                    return cached[1] if cached else "unknown"
+                self._registry_status = "Registry unavailable"
+                self._log_registry_warning(f"Registry check failed for '{ref}': {exc}")
+                return cached[1] if cached else "registry-error"
             attrs = getattr(data, "attrs", None) or {}
             descriptor = attrs.get("Descriptor") or {}
             remote = descriptor.get("digest") or attrs.get("Digest")
             if not remote:
-                return "unknown"
-            return "up-to-date" if local == remote else "update"
+                return self._cache_registry_result(ref, "unknown")
+            return self._cache_registry_result(ref, "up-to-date" if local == remote else "update")
         except Exception:
             return "unknown"
+
+    def _cache_registry_result(self, ref: str, state: str) -> str:
+        self._registry_cache[ref] = (time.monotonic(), state)
+        if time.monotonic() >= self._registry_cooldown_until:
+            self._registry_backoff = 60.0
+            self._registry_status = ""
+        return state
+
+    @staticmethod
+    def _is_rate_limited(exc: Exception) -> bool:
+        response = getattr(exc, "response", None)
+        status = getattr(exc, "status_code", None) or getattr(response, "status_code", None)
+        return status == 429 or "429" in str(exc)
+
+    def _enter_registry_cooldown(self) -> None:
+        now = time.monotonic()
+        self._registry_cooldown_until = now + self._registry_backoff
+        self._registry_status = f"Registry rate limited - retrying in {max(1, round(self._registry_backoff / 60))} minutes"
+        self._registry_backoff = min(MAX_REGISTRY_BACKOFF, self._registry_backoff * 2)
+        self._log_registry_warning(self._registry_status)
+        self._refresh_header()
+
+    def _set_registry_status(self) -> None:
+        remaining = max(1, round((self._registry_cooldown_until - time.monotonic()) / 60))
+        self._registry_status = f"Registry rate limited - retrying in {remaining} minutes"
+
+    def _log_registry_warning(self, message: str) -> None:
+        now = time.monotonic()
+        if now - self._registry_notice_at >= 60:
+            self._registry_notice_at = now
+            self.push_log(message, GRUVBOX_YELLOW)
 
     def _apply_update_status(self, results: dict, generation: int | None = None) -> None:
         self._check_in_flight = False
@@ -525,7 +765,13 @@ class DockerTUI(App):
         if self.client is None or self._stats_in_flight or not self._container_by_key:
             return
         self._stats_in_flight = True
+        self._stats_started_at = time.monotonic()
+        self._refresh_header()
         self._stats_worker(self._scan_generation)
+
+    def _refresh_stats_wait(self) -> None:
+        if self._stats_in_flight:
+            self._refresh_header()
 
     @work(thread=True)
     def _stats_worker(self, generation: int) -> None:
@@ -540,7 +786,7 @@ class DockerTUI(App):
                     snapshot[cid] = None
                     continue
                 try:
-                    sample = container.stats(stream=False)
+                    sample = self._read_stats_sample(container)
                     snapshot[cid] = (self._compute_cpu(sample), self._compute_mem(sample))
                 except Exception:
                     snapshot[cid] = None
@@ -549,6 +795,19 @@ class DockerTUI(App):
         finally:
             if not self._quitting:
                 self.call_from_thread(self._apply_stats, snapshot, generation)
+
+    @staticmethod
+    def _read_stats_sample(container) -> dict:
+        stream = container.stats(stream=True, decode=True)
+        try:
+            sample = next(iter(stream))
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+        if not isinstance(sample, dict):
+            raise RuntimeError("Docker returned an invalid stats sample")
+        return sample
 
     @staticmethod
     def _compute_cpu(sample: dict):
@@ -577,6 +836,7 @@ class DockerTUI(App):
 
     def _apply_stats(self, snapshot: dict, generation: int | None = None) -> None:
         self._stats_in_flight = False
+        self._stats_started_at = None
         if (generation is not None and generation != self._scan_generation) or self._quitting:
             return
         for cid, pair in snapshot.items():
@@ -598,9 +858,12 @@ class DockerTUI(App):
         self._refresh_header()
 
     def _pct_cell(self, value: float | None) -> Text:
-        if value is None:
-            return Text("\u2013", style=f"bold {GRUVBOX_GRAY}")
-        return Text(self._format_pct(value), style=f"bold {self._pct_color(value)}")
+        text = Text()
+        color = f"bold {self._pct_color(value)}"
+        text.append(self._gauge(value, width=4), style=color)
+        text.append(" ", style=GRUVBOX_GRAY)
+        text.append("--" if value is None else self._format_pct(value), style=color)
+        return text
 
     @staticmethod
     def _format_pct(value: float) -> str:
@@ -634,6 +897,12 @@ class DockerTUI(App):
             return GRUVBOX_YELLOW
         return GRUVBOX_GREEN
 
+    def _stats_wait_label(self, now: float | None = None) -> str | None:
+        if not self._stats_in_flight or self._stats_started_at is None:
+            return None
+        elapsed = max(0, int((time.monotonic() if now is None else now) - self._stats_started_at))
+        return f"STATS {'|/-\\'[elapsed % 4]} {elapsed}s"
+
     @staticmethod
     def _sparkline(values: list[float | None], width: int = 12) -> str:
         points = [value for value in values if value is not None]
@@ -658,18 +927,22 @@ class DockerTUI(App):
         mems = [mem for _cpu, mem in values if mem is not None]
         avg_cpu = sum(cpus) / len(cpus) if cpus else None
         avg_mem = sum(mems) / len(mems) if mems else None
-        suffix = "" if updates == 1 else "s"
-
-        header = Text(
-            f"{len(items)} containers | {running} running | {updates} update{suffix} | "
-            "CPU ",
-            style="bold",
+        header = Text(f"{len(items)} containers | {running} running | ", style="bold")
+        header.append(
+            f"{updates} update available" if updates else "0 updates",
+            style=f"bold {GRUVBOX_ORANGE if updates else GRUVBOX_GREEN}",
         )
+        header.append(" | CPU ", style="bold")
         header.append(self._gauge_pct(avg_cpu, width=6))
         header.append("  MEM ", style="bold")
         header.append(self._gauge_pct(avg_mem, width=6))
+        stats_wait = self._stats_wait_label()
+        if stats_wait:
+            header.append(f"  {stats_wait}", style=f"bold {GRUVBOX_YELLOW}")
         if self._docker_state == "unavailable":
             header.append("  DOCKER UNAVAILABLE - press r", style=f"bold {GRUVBOX_RED}")
+        if self._registry_status:
+            header.append(f"  {self._registry_status}", style=f"bold {GRUVBOX_YELLOW}")
         self.stats.update(header)
 
     # --- details panel -----------------------------------------------------
@@ -719,6 +992,12 @@ class DockerTUI(App):
         self._set_detail("d-ports", ("PORTS  ", GRUVBOX_GRAY), (ports, GRUVBOX_FG))
         self._set_detail("d-stats", (self._stats_block(cpu, mem, cpu_text, mem_text, history), ""))
         self._set_detail("d-update", ("UPDATE ", GRUVBOX_GRAY), (state_text, f"bold {state_color}"))
+        restart_time = ((attrs.get("State") or {}).get("StartedAt") or "")
+        networks = ", ".join(sorted((attrs.get("NetworkSettings") or {}).get("Networks") or {})) or "none"
+        volume_count = len(attrs.get("Mounts") or [])
+        self._set_detail("d-restart-time", ("STARTED", GRUVBOX_GRAY), (self._fmt_created(restart_time), GRUVBOX_FG))
+        self._set_detail("d-network", ("NETWORK", GRUVBOX_GRAY), (networks, GRUVBOX_FG))
+        self._set_detail("d-volumes", ("VOLUMES", GRUVBOX_GRAY), (str(volume_count), GRUVBOX_FG))
 
     def _stats_block(
         self,
@@ -1004,7 +1283,7 @@ class DockerTUI(App):
 
     def _set_upd_cell(self, cid: str, state: str) -> None:
         try:
-            self.table.update_cell(cid, "upd", Text(UPDATE_GLYPH[state], style=f"bold {UPDATE_COLOR[state]}"))
+            self.table.update_cell(cid, "upd", self._update_cell(state))
         except Exception:
             pass
 

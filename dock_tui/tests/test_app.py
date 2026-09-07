@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from datetime import datetime, timezone
 
 import docker.errors
@@ -110,7 +111,9 @@ class FakeContainer:
             raise docker.errors.APIError("fake remove failure", explanation="fake")
         self._removed = True
 
-    def stats(self, stream=False):
+    def stats(self, stream=False, decode=False):
+        if stream:
+            return iter([STATS_SAMPLE])
         if self.status != "running":
             raise docker.errors.APIError("container is not running", explanation="fake")
         return STATS_SAMPLE
@@ -289,6 +292,19 @@ def test_resource_sparkline_and_history_are_bounded():
     sparkline = app._sparkline([pair[0] for pair in history])
     assert len(sparkline) == 12
     assert sparkline[-1] != "\u00b7"
+
+
+def test_stats_wait_label_reports_elapsed_collection_time():
+    app = DockerTUI()
+    app._stats_in_flight = True
+    app._stats_started_at = 100.0
+
+    assert app._stats_wait_label(now=112.9) == "STATS | 12s"
+
+
+def test_stats_sample_uses_first_decoded_stream_item():
+    container = make_client()._containers[0]
+    assert DockerTUI._read_stats_sample(container) == STATS_SAMPLE
 
 
 def test_update_start_rejects_duplicate_requests():
