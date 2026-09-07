@@ -189,7 +189,7 @@ def make_client():
 async def test_stats_none_pair_regressions():
     state = {"client": None}
 
-    def from_env():
+    def from_env(*args, **kwargs):
         if state["client"] is None:
             state["client"] = make_client()
         return state["client"]
@@ -224,7 +224,7 @@ async def test_stats_none_pair_regressions():
 async def test_update_preserves_compose_config():
     state = {"client": None}
 
-    def from_env():
+    def from_env(*args, **kwargs):
         if state["client"] is None:
             state["client"] = make_client()
             client = state["client"]
@@ -264,7 +264,7 @@ async def test_update_preserves_compose_config():
 async def run_main():
     state = {"client": None}
 
-    def from_env():
+    def from_env(*args, **kwargs):
         if state["client"] is None:
             state["client"] = make_client()
         return state["client"]

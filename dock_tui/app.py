@@ -80,6 +80,8 @@ class DockerTUI(App):
         self._update_status: dict[str, str] = {}
         self._stats_in_flight = False
         self._check_in_flight = False
+        self._quitting = False
+        self._interval_handles: list = []
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
@@ -121,7 +123,7 @@ class DockerTUI(App):
         self.table.add_column("UPD", key="upd", width=5)
         self.push_log("Welcome to DOCKPIT.", f"bold {GRUVBOX_YELLOW}")
         try:
-            self.client = docker.from_env()
+            self.client = docker.from_env(timeout=30)
             version = (self.client.version() or {}).get("Version", "?")
         except Exception as exc:
             self.client = None
@@ -137,13 +139,30 @@ class DockerTUI(App):
         self.push_log(f"Connected to Docker daemon (API {version}).", f"bold {GRUVBOX_GREEN}")
         self._scan_worker()
         self.table.focus()
-        self.set_interval(2.0, self._on_stats_timer)
-        self.set_interval(60.0, self._on_update_check_timer)
+        self._interval_handles.append(self.set_interval(2.0, self._on_stats_timer))
+        self._interval_handles.append(self.set_interval(60.0, self._on_update_check_timer))
+
+    # --- shutdown ----------------------------------------------------------
+
+    def action_help_quit(self) -> None:
+        """Ctrl+C: quit gracefully instead of showing Textual's 'press q' reminder."""
+        self.exit()
+
+    def on_unmount(self) -> None:
+        self._quitting = True
+        for timer in self._interval_handles:
+            timer.stop()
+        self._interval_handles.clear()
+        try:
+            if self.client is not None:
+                self.client.close()
+        except Exception:
+            pass
 
     # --- logging -----------------------------------------------------------
 
     def push_log(self, message: str, style: str = "") -> None:
-        if self.output is None:
+        if self.output is None or self._quitting:
             return
         if self._thread_id == threading.get_ident():
             self._write_log(message, style)
@@ -157,7 +176,7 @@ class DockerTUI(App):
 
     @work(thread=True)
     def _scan_worker(self) -> None:
-        if self.client is None:
+        if self.client is None or self._quitting:
             self.push_log("No Docker connection - press r to retry.", f"bold {GRUVBOX_RED}")
             return
         try:
@@ -168,7 +187,8 @@ class DockerTUI(App):
         except Exception as exc:
             self.push_log(f"Failed to list containers: {exc}", f"bold {GRUVBOX_RED}")
             containers = []
-        self.call_from_thread(self._populate_table, containers)
+        if not self._quitting:
+            self.call_from_thread(self._populate_table, containers)
 
     def _populate_table(self, containers: list) -> None:
         prev_selected = self._selected_id if self._selected_id in self._container_by_key else None
@@ -238,9 +258,12 @@ class DockerTUI(App):
         results = {}
         try:
             for cid, container in list(self._container_by_key.items()):
+                if self._quitting:
+                    return
                 results[cid] = self._check_update(container)
         finally:
-            self.call_from_thread(self._apply_update_status, results)
+            if not self._quitting:
+                self.call_from_thread(self._apply_update_status, results)
 
     def _check_update(self, container) -> str:
         if self.client is None:
@@ -297,8 +320,12 @@ class DockerTUI(App):
 
     @work(thread=True)
     def _stats_worker(self) -> None:
+        if self._quitting:
+            return
         snapshot = {}
         for cid, container in list(self._container_by_key.items()):
+            if self._quitting:
+                return
             if container.status != "running":
                 snapshot[cid] = None
                 continue
@@ -307,7 +334,8 @@ class DockerTUI(App):
                 snapshot[cid] = (self._compute_cpu(sample), self._compute_mem(sample))
             except Exception:
                 snapshot[cid] = None
-        self.call_from_thread(self._apply_stats, snapshot)
+        if not self._quitting:
+            self.call_from_thread(self._apply_stats, snapshot)
 
     @staticmethod
     def _compute_cpu(sample: dict):
@@ -567,7 +595,8 @@ class DockerTUI(App):
     @work(thread=True)
     def _update_worker(self, container) -> None:
         self._do_update(container)
-        self.call_from_thread(self._scan_worker)
+        if not self._quitting:
+            self.call_from_thread(self._scan_worker)
 
     @work(thread=True)
     def _update_all_worker(self, targets: list) -> None:
@@ -578,11 +607,12 @@ class DockerTUI(App):
                 ok += 1
             else:
                 failed += 1
-        self.push_log(
-            f"Update-all finished: {ok} updated, {failed} failed.",
-            f"bold {GRUVBOX_GREEN if failed == 0 else GRUVBOX_ORANGE}",
-        )
-        self.call_from_thread(self._scan_worker)
+        if not self._quitting:
+            self.push_log(
+                f"Update-all finished: {ok} updated, {failed} failed.",
+                f"bold {GRUVBOX_GREEN if failed == 0 else GRUVBOX_ORANGE}",
+            )
+            self.call_from_thread(self._scan_worker)
 
     def _do_update(self, container) -> bool:
         cid = container.id
