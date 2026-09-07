@@ -209,7 +209,7 @@ async def test_stats_none_pair_regressions():
         except TypeError as exc:
             raise AssertionError(f"header crashed on None mem pair: {exc}")
         header = app.stats.content if isinstance(app.stats.content, str) else str(app.stats.content)
-        assert "MEM –" in header and "CPU 50.6%" in header, header
+        assert "MEM" in header and "CPU" in header, header
 
         snapshot = {web.id: (20.0, 0.4), util.id: (0.0, None)}
         try:
@@ -217,7 +217,8 @@ async def test_stats_none_pair_regressions():
         except TypeError as exc:
             raise AssertionError(f"apply_stats crashed on None pair: {exc}")
         header = app.stats.content if isinstance(app.stats.content, str) else str(app.stats.content)
-        assert "CPU 10.0%" in header and "MEM 0.4%" in header, header
+        assert "CPU" in header and "MEM" in header, header
+        assert "\u2588" in header and "\u2591" in header, "header should render block gauges"
 
 
 async def test_update_preserves_compose_config():
@@ -283,7 +284,9 @@ async def run_main():
         assert app._update_status.get("id_web") == "update", app._update_status
         assert app._update_status.get("id_util") == "up-to-date", app._update_status
         header = app.stats.content if isinstance(app.stats.content, str) else str(app.stats.content)
-        assert "2 containers" in header and "1 update" in header and "CPU 20.0%" in header
+        assert "2 containers" in header and "1 update" in header, header
+        assert "CPU" in header and "MEM" in header, header
+        assert "\u2588" in header and "\u2591" in header, "header should render block gauges"
 
         selected = app._selected_id
         assert selected == "id_web", selected

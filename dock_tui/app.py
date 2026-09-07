@@ -1,6 +1,7 @@
-"""Docker TUI - a Gruvbox-styled, htop-inspired container manager built with Textual."""
+"""DOCKPIT - a btop/htop-inspired Docker container manager built with Textual."""
 
 import threading
+from collections import deque
 from datetime import datetime, timezone
 
 import docker
@@ -22,23 +23,33 @@ GRUVBOX_YELLOW = "#fabd2f"
 GRUVBOX_ORANGE = "#fe8019"
 GRUVBOX_GREEN = "#b8bb26"
 GRUVBOX_RED = "#fb4934"
+GRUVBOX_AQUA = "#8ec07c"
 
-STATUS_COLORS = {
-    "running": GRUVBOX_GREEN,
-    "exited": GRUVBOX_RED,
-    "dead": GRUVBOX_RED,
-    "created": GRUVBOX_YELLOW,
+STATUS_DISPLAY = {
+    "running": ("\u25cf running", GRUVBOX_GREEN),
+    "exited": ("\u25a0 stopped", GRUVBOX_RED),
+    "dead": ("\u25a0 dead", GRUVBOX_RED),
+    "created": ("\u25a3 created", GRUVBOX_YELLOW),
+    "paused": ("\u23f8 paused", GRUVBOX_AQUA),
 }
 
 UPDATE_DISPLAY = {
-    "update": ("\u2191 update", GRUVBOX_ORANGE),
-    "up-to-date": ("\u2713 current", GRUVBOX_GREEN),
+    "update": ("\u25b2 update avail", GRUVBOX_ORANGE),
+    "up-to-date": ("\u2714 current", GRUVBOX_GREEN),
     "local": ("\u00b7 local only", GRUVBOX_GRAY),
     "unknown": ("? unknown", GRUVBOX_GRAY),
-    "updating": ("\u27f3 updating", GRUVBOX_YELLOW),
+    "updating": ("\u21bb updating", GRUVBOX_AQUA),
 }
 UPDATE_GLYPH = {key: value[0].split()[0] for key, value in UPDATE_DISPLAY.items()}
 UPDATE_COLOR = {key: value[1] for key, value in UPDATE_DISPLAY.items()}
+
+DOCKPIT_BANNER = """\u2588   \u2588  \u2588\u2588\u2588   \u2588\u2588\u2588  \u2588  \u2588 \u2588\u2588\u2588\u2588  \u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588
+\u2588\u2588  \u2588 \u2588   \u2588 \u2588     \u2588 \u2588  \u2588  \u2588  \u2588     \u2588  
+\u2588 \u2588 \u2588 \u2588   \u2588 \u2588     \u2588\u2588   \u2588  \u2588  \u2588     \u2588  
+\u2588  \u2588\u2588 \u2588   \u2588 \u2588     \u2588\u2588   \u2588\u2588\u2588\u2588   \u2588     \u2588  
+\u2588   \u2588 \u2588   \u2588 \u2588     \u2588 \u2588  \u2588      \u2588     \u2588  
+\u2588   \u2588  \u2588\u2588\u2588   \u2588\u2588\u2588  \u2588  \u2588 \u2588     \u2588\u2588\u2588    \u2588  
+""".strip("\n")
 
 DETAIL_IDS = (
     "d-name",
@@ -48,14 +59,16 @@ DETAIL_IDS = (
     "d-created",
     "d-ports",
     "d-stats",
+    "d-spark",
     "d-update",
 )
 
 
 class DockerTUI(App):
-    """htop-inspired Docker container TUI in a vintage Gruvbox palette."""
+    """btop/htop-inspired Docker container TUI in a vintage terminal palette."""
 
-    TITLE = "DOCKER TUI - GRUVBOX CONTROL"
+    TITLE = "DOCKPIT"
+    CSS_PATH = "app.tcss"
 
     BINDINGS = [
         Binding("u", "update_selected", "Update"),
@@ -63,116 +76,6 @@ class DockerTUI(App):
         Binding("r", "rescan", "Refresh"),
         Binding("q", "quit", "Quit"),
     ]
-
-    CSS = """
-    Screen {
-        background: #282828;
-        color: #ebdbb2;
-        layout: vertical;
-    }
-
-    #app-header {
-        height: 3;
-        background: #3c3836;
-        border-bottom: heavy #504945;
-        align: center middle;
-    }
-
-    #app-title {
-        color: #fabd2f;
-        text-style: bold;
-        content-align: center middle;
-        width: 1fr;
-    }
-
-    #container-stats {
-        color: #b8bb26;
-        text-style: bold;
-        content-align: right middle;
-        width: auto;
-        padding: 0 2;
-    }
-
-    #main {
-        width: 1fr;
-        height: 3fr;
-        layout: horizontal;
-    }
-
-    #containers {
-        width: 56%;
-        height: 1fr;
-        margin: 0 0 0 1;
-        border: round #504945;
-        background: #1d2021;
-        color: #ebdbb2;
-    }
-
-    #containers > .datatable--header {
-        background: #3c3836;
-        color: #fabd2f;
-        text-style: bold;
-    }
-
-    #containers > .datatable--cursor {
-        background: #504945;
-        color: #ebdbb2;
-        text-style: bold;
-    }
-
-    #containers > .datatable--hover {
-        background: #3c3836;
-    }
-
-    #details {
-        width: 44%;
-        height: 1fr;
-        margin: 0 1 0 1;
-        padding: 0 1;
-        border: round #504945;
-        background: #1d2021;
-        color: #ebdbb2;
-    }
-
-    .panel-title {
-        color: #fe8019;
-        text-style: bold;
-        background: #282828;
-        padding: 0 1;
-        margin-bottom: 1;
-    }
-
-    .detail-row {
-        height: auto;
-        margin-bottom: 1;
-    }
-
-    #output {
-        height: 2fr;
-        margin: 0 1 1 1;
-        border: round #504945;
-        background: #1d2021;
-        color: #ebdbb2;
-        padding: 0 1;
-    }
-
-    #containers:focus {
-        border: round #fabd2f;
-    }
-
-    Footer {
-        background: #3c3836;
-    }
-
-    Footer > .footer--key {
-        color: #fbf1c7;
-        text-style: bold;
-    }
-
-    Footer > .footer--description {
-        color: #ebdbb2;
-    }
-    """
 
     def __init__(self) -> None:
         super().__init__()
@@ -185,13 +88,18 @@ class DockerTUI(App):
         self._updating: set[str] = set()
         self._stats: dict[str, tuple] = {}
         self._update_status: dict[str, str] = {}
+        self._history: dict[str, dict] = {}
         self._stats_in_flight = False
         self._check_in_flight = False
 
     def compose(self) -> ComposeResult:
-        yield Horizontal(
-            Static("DOCKER TUI - GRUVBOX CONTROL", id="app-title"),
-            Static("starting\u2026", id="container-stats"),
+        yield Vertical(
+            Horizontal(
+                Static("DOCKPIT", id="app-title"),
+                Static("starting\u2026", id="container-stats"),
+                id="app-header-top",
+            ),
+            Static(DOCKPIT_BANNER, id="app-banner"),
             id="app-header",
         )
         yield Horizontal(
@@ -205,6 +113,7 @@ class DockerTUI(App):
                 Static("", id="d-created", classes="detail-row"),
                 Static("", id="d-ports", classes="detail-row"),
                 Static("", id="d-stats", classes="detail-row"),
+                Static("", id="d-spark", classes="detail-row"),
                 Static("", id="d-update", classes="detail-row"),
                 id="details",
             ),
@@ -217,13 +126,16 @@ class DockerTUI(App):
         self.table = self.query_one("#containers", DataTable)
         self.output = self.query_one("#output", RichLog)
         self.stats = self.query_one("#container-stats", Static)
+        self.table.border_title = " CONTAINERS "
+        self.query_one("#details", Vertical).border_title = " DETAILS "
+        self.output.border_title = " LOG "
         self.table.cursor_type = "row"
-        self.table.add_column("NAME", key="name", width=30)
+        self.table.add_column("NAME", key="name", width=24)
         self.table.add_column("STATUS", key="status", width=10)
-        self.table.add_column("CPU", key="cpu", width=8)
-        self.table.add_column("MEM", key="mem", width=8)
+        self.table.add_column("CPU", key="cpu", width=14)
+        self.table.add_column("MEM", key="mem", width=14)
         self.table.add_column("UPD", key="upd", width=5)
-        self.push_log("Welcome to the Docker TUI - Gruvbox Control.", f"bold {GRUVBOX_YELLOW}")
+        self.push_log("Welcome to DOCKPIT.", f"bold {GRUVBOX_YELLOW}")
         try:
             self.client = docker.from_env()
             version = (self.client.version() or {}).get("Version", "?")
@@ -302,10 +214,10 @@ class DockerTUI(App):
         name = (container.name or container.id).lstrip("/")
         image = (attrs.get("Config") or {}).get("Image") or "?"
         status = container.status or (attrs.get("State") or {}).get("Status") or "unknown"
-        status_color = STATUS_COLORS.get(status, GRUVBOX_YELLOW)
+        status_label, status_color = STATUS_DISPLAY.get(status, (f"? {status}", GRUVBOX_YELLOW))
         self.table.add_row(
             Text(name, style=f"bold {GRUVBOX_FG}"),
-            Text(status, style=f"bold {status_color}"),
+            Text(f"{status_label}", style=f"bold {status_color}"),
             Text("\u2013", style=GRUVBOX_GRAY),
             Text("\u2013", style=GRUVBOX_GRAY),
             Text("\u2013", style=GRUVBOX_GRAY),
@@ -445,29 +357,66 @@ class DockerTUI(App):
             cpu = mem = None
             if pair is not None:
                 cpu, mem = pair
-            cpu_text = "\u2013" if cpu is None else f"{cpu:.1f}%"
-            mem_text = "\u2013" if mem is None else self._format_pct(mem)
+            self._record_stats(cid, cpu, mem)
             try:
-                self.table.update_cell(cid, "cpu", Text(cpu_text, style=f"bold {self._pct_color(cpu)}"))
-                self.table.update_cell(cid, "mem", Text(mem_text, style=f"bold {self._pct_color(mem)}"))
+                self.table.update_cell(cid, "cpu", self._gauge_pct(cpu, width=8))
+                self.table.update_cell(cid, "mem", self._gauge_pct(mem, width=8))
             except Exception:
                 pass
         if self._selected_id in self._container_by_key:
             self._update_details(self._selected_id)
         self._refresh_header()
 
+    def _record_stats(self, cid: str, cpu: float | None, mem: float | None) -> None:
+        history = self._history.setdefault(cid, {"cpu": deque(maxlen=10), "mem": deque(maxlen=10)})
+        if cpu is not None:
+            history["cpu"].append(cpu)
+        if mem is not None:
+            history["mem"].append(mem)
+
     @staticmethod
     def _format_pct(value: float) -> str:
         return f"{value:.1f}%" if value < 10 else f"{value:.0f}%"
 
     @staticmethod
+    def _gauge(value: float | None, width: int = 10) -> str:
+        if value is None:
+            return "\u2591" * width
+        ratio = max(0.0, min(100.0, value)) / 100.0
+        filled = round(ratio * width)
+        return "\u2588" * filled + "\u2591" * (width - filled)
+
+    def _gauge_pct(self, value: float | None, width: int = 10) -> Text:
+        text = Text()
+        if value is None:
+            text.append(f"{self._gauge(value, width)}  \u2013", style=GRUVBOX_GRAY)
+            return text
+        color = f"bold {self._pct_color(value)}"
+        text.append(self._gauge(value, width), style=color)
+        text.append(f" {self._format_pct(value)}", style=color)
+        return text
+
+    @staticmethod
+    def _sparkline(values, width: int = 10) -> str:
+        vals = list(values)
+        if not vals:
+            return "\u2591" * width
+        lo, hi = min(vals), max(vals)
+        span = hi - lo or 1.0
+        chars = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+        line = "".join(chars[min(len(chars) - 1, int((v - lo) / span * len(chars)))] for v in vals)
+        if len(line) < width:
+            line += "\u2591" * (width - len(line))
+        return line[:width]
+
+    @staticmethod
     def _pct_color(value: float | None) -> str:
         if value is None:
             return GRUVBOX_GRAY
-        if value >= 70:
+        if value >= 80:
             return GRUVBOX_RED
-        if value >= 40:
-            return GRUVBOX_ORANGE
+        if value >= 50:
+            return GRUVBOX_YELLOW
         return GRUVBOX_GREEN
 
     # --- header ------------------------------------------------------------
@@ -479,13 +428,19 @@ class DockerTUI(App):
         values = [pair for pair in self._stats.values() if pair is not None]
         cpus = [cpu for cpu, _mem in values if cpu is not None]
         mems = [mem for _cpu, mem in values if mem is not None]
-        cpu = f"{sum(cpus) / len(cpus):.1f}%" if cpus else "\u2013"
-        mem = self._format_pct(sum(mems) / len(mems)) if mems else "\u2013"
+        avg_cpu = sum(cpus) / len(cpus) if cpus else None
+        avg_mem = sum(mems) / len(mems) if mems else None
         suffix = "" if updates == 1 else "s"
-        self.stats.update(
-            f"{len(items)} containers | {running} running | {updates} update{suffix} "
-            f"| CPU {cpu} | MEM {mem}"
+
+        header = Text(
+            f"{len(items)} containers | {running} running | {updates} update{suffix} | "
+            "CPU ",
+            style="bold",
         )
+        header.append(self._gauge_pct(avg_cpu, width=6))
+        header.append("  MEM ", style="bold")
+        header.append(self._gauge_pct(avg_mem, width=6))
+        self.stats.update(header)
 
     # --- details panel -----------------------------------------------------
 
@@ -511,6 +466,8 @@ class DockerTUI(App):
         mem_text = "\u2013" if mem is None else self._format_pct(mem)
         state = self._update_status.get(cid, "unknown")
         state_text, state_color = UPDATE_DISPLAY.get(state, UPDATE_DISPLAY["unknown"])
+        status_label, status_color = STATUS_DISPLAY.get(status, (f"? {status}", GRUVBOX_YELLOW))
+        history = self._history.get(cid)
 
         self._set_detail("d-name", (name, f"bold {GRUVBOX_FG}"))
         self._set_detail(
@@ -522,16 +479,24 @@ class DockerTUI(App):
         self._set_detail(
             "d-status",
             ("STATUS ", GRUVBOX_GRAY),
-            (status, f"bold {STATUS_COLORS.get(status, GRUVBOX_YELLOW)}"),
+            (status_label, f"bold {status_color}"),
         )
         self._set_detail("d-created", ("UP     ", GRUVBOX_GRAY), (self._fmt_created(created), GRUVBOX_FG))
         self._set_detail("d-ports", ("PORTS  ", GRUVBOX_GRAY), (ports, GRUVBOX_FG))
         self._set_detail(
             "d-stats",
-            ("CPU    ", GRUVBOX_GRAY),
-            (cpu_text, f"bold {self._pct_color(cpu)}"),
-            ("   MEM ", GRUVBOX_GRAY),
-            (mem_text, f"bold {self._pct_color(mem)}"),
+            ("CPU ", GRUVBOX_GRAY),
+            (self._gauge(cpu, width=10), f"bold {self._pct_color(cpu)}"),
+            (f" {cpu_text}  MEM ", GRUVBOX_GRAY),
+            (self._gauge(mem, width=10), f"bold {self._pct_color(mem)}"),
+            (f" {mem_text}", f"bold {self._pct_color(mem)}"),
+        )
+        self._set_detail(
+            "d-spark",
+            ("CPU ", GRUVBOX_GRAY),
+            (self._sparkline((history or {}).get("cpu", [])), f"bold {GRUVBOX_AQUA}"),
+            ("  MEM ", GRUVBOX_GRAY),
+            (self._sparkline((history or {}).get("mem", [])), f"bold {GRUVBOX_AQUA}"),
         )
         self._set_detail("d-update", ("UPDATE ", GRUVBOX_GRAY), (state_text, f"bold {state_color}"))
 

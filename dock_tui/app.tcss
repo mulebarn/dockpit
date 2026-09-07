@@ -1,0 +1,126 @@
+Screen {
+    background: #282828;
+    color: #ebdbb2;
+    layout: vertical;
+}
+
+#app-header {
+    height: auto;
+    background: #3c3836;
+    border-bottom: heavy #504945;
+    padding: 0 1;
+}
+
+#app-header-top {
+    height: 1;
+    width: 100%;
+}
+
+#app-title {
+    color: #fabd2f;
+    text-style: bold;
+    content-align: left middle;
+    width: 1fr;
+    padding: 0 0 0 1;
+}
+
+#container-stats {
+    color: #b8bb26;
+    text-style: bold;
+    content-align: right middle;
+    width: auto;
+    padding: 0 2;
+}
+
+#app-banner {
+    color: #fe8019;
+    text-style: bold;
+    background: #282828;
+    content-align: center middle;
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+}
+
+#main {
+    width: 1fr;
+    height: 3fr;
+    layout: horizontal;
+}
+
+#containers {
+    width: 60%;
+    height: 1fr;
+    margin: 0 0 0 1;
+    border: heavy #504945;
+    border-title-color: #fe8019;
+    background: #1d2021;
+    color: #ebdbb2;
+}
+
+#containers > .datatable--header {
+    background: #3c3836;
+    color: #fabd2f;
+    text-style: bold;
+}
+
+#containers > .datatable--cursor {
+    background: #504945;
+    color: #ebdbb2;
+    text-style: bold;
+}
+
+#containers > .datatable--hover {
+    background: #3c3836;
+}
+
+#details {
+    width: 40%;
+    height: 1fr;
+    margin: 0 1 0 1;
+    padding: 0 1;
+    border: round #8ec07c;
+    border-title-color: #8ec07c;
+    background: #1d2021;
+    color: #ebdbb2;
+}
+
+.panel-title {
+    color: #fe8019;
+    text-style: bold;
+    background: #282828;
+    padding: 0 1;
+    margin-bottom: 1;
+}
+
+.detail-row {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#output {
+    height: 2fr;
+    margin: 0 1 1 1;
+    padding: 0 1;
+    border: round #504945;
+    border-title-color: #fabd2f;
+    background: #1d2021;
+    color: #ebdbb2;
+}
+
+#containers:focus {
+    border: heavy #fabd2f;
+}
+
+Footer {
+    background: #3c3836;
+}
+
+Footer > .footer--key {
+    color: #fbf1c7;
+    text-style: bold;
+}
+
+Footer > .footer--description {
+    color: #ebdbb2;
+}
