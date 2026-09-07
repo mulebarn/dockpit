@@ -19,6 +19,22 @@ Screen {
     padding: 0 0 0 1;
 }
 
+#container-filter {
+    width: 28;
+    margin: 0 2;
+    background: #1d2021;
+    border: tall #504945;
+    color: #ebdbb2;
+}
+
+#log-filter {
+    width: 24;
+    margin: 0 1;
+    background: #1d2021;
+    border: tall #504945;
+    color: #ebdbb2;
+}
+
 #container-stats {
     color: #b8bb26;
     text-style: bold;
@@ -95,6 +111,39 @@ Screen {
 
 #containers:focus {
     border: heavy #fabd2f;
+}
+
+ConfirmScreen {
+    align: center middle;
+    background: rgba(0, 0, 0, 0.72);
+}
+
+#confirm-dialog {
+    width: 64;
+    height: auto;
+    padding: 1 2;
+    border: heavy #fabd2f;
+    background: #1d2021;
+}
+
+.confirm-title {
+    color: #fabd2f;
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#confirm-message {
+    color: #ebdbb2;
+    margin-bottom: 1;
+}
+
+#confirm-actions {
+    align: right middle;
+    height: auto;
+}
+
+#confirm-actions Button {
+    margin-left: 1;
 }
 
 Footer {

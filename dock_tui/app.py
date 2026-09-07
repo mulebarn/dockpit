@@ -1,5 +1,6 @@
 """DOCKPIT - a btop/htop-inspired Docker container manager built with Textual."""
 
+import json
 import threading
 from datetime import datetime, timezone
 
@@ -10,7 +11,8 @@ from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Footer, RichLog, Static
+from textual.screen import ModalScreen
+from textual.widgets import Button, DataTable, Footer, Input, RichLog, Static
 
 GRUVBOX_BG = "#282828"
 GRUVBOX_MED = "#3c3836"
@@ -23,6 +25,7 @@ GRUVBOX_ORANGE = "#fe8019"
 GRUVBOX_GREEN = "#b8bb26"
 GRUVBOX_RED = "#fb4934"
 GRUVBOX_AQUA = "#8ec07c"
+MAX_LOG_HISTORY = 5000
 
 STATUS_DISPLAY = {
     "running": ("\u25cf running", GRUVBOX_GREEN),
@@ -38,6 +41,14 @@ UPDATE_DISPLAY = {
     "local": ("\u00b7 local only", GRUVBOX_GRAY),
     "unknown": ("? unknown", GRUVBOX_GRAY),
     "updating": ("\u21bb updating", GRUVBOX_AQUA),
+    "pulling": ("\u21bb pulling", GRUVBOX_AQUA),
+    "stopping": ("\u25a0 stopping", GRUVBOX_YELLOW),
+    "removing": ("\u2212 removing", GRUVBOX_YELLOW),
+    "recreating": ("\u21bb recreating", GRUVBOX_AQUA),
+    "restoring": ("\u21b3 networks", GRUVBOX_AQUA),
+    "recovered": ("\u21ba recovered", GRUVBOX_YELLOW),
+    "degraded": ("\u26a0 degraded", GRUVBOX_ORANGE),
+    "failed": ("\u2716 failed", GRUVBOX_RED),
 }
 UPDATE_GLYPH = {key: value[0].split()[0] for key, value in UPDATE_DISPLAY.items()}
 UPDATE_COLOR = {key: value[1] for key, value in UPDATE_DISPLAY.items()}
@@ -53,6 +64,50 @@ DETAIL_IDS = (
     "d-update",
 )
 
+HEALTH_DISPLAY = {
+    "healthy": ("\u2714 healthy", GRUVBOX_GREEN),
+    "unhealthy": ("\u2716 unhealthy", GRUVBOX_RED),
+    "starting": ("\u21bb starting", GRUVBOX_YELLOW),
+}
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    BINDINGS = [
+        Binding("enter", "confirm", "Confirm", show=False),
+        Binding("y", "confirm", "Confirm", show=False),
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("n", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("CONFIRM ACTION", classes="confirm-title"),
+            Static(self.message, id="confirm-message"),
+            Horizontal(
+                Button("Cancel", id="cancel-confirm"),
+                Button("Confirm", variant="warning", id="accept-confirm"),
+                id="confirm-actions",
+            ),
+            id="confirm-dialog",
+        )
+
+    def on_mount(self) -> None:
+        self.query_one("#accept-confirm", Button).focus()
+
+    def action_confirm(self) -> None:
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+    @on(Button.Pressed)
+    def _on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "accept-confirm")
+
 
 class DockerTUI(App):
     """btop/htop-inspired Docker container TUI in a vintage terminal palette."""
@@ -63,6 +118,16 @@ class DockerTUI(App):
     BINDINGS = [
         Binding("u", "update_selected", "Update"),
         Binding("U", "update_all", "Update all"),
+        Binding("s", "start_selected", "Start"),
+        Binding("d", "stop_selected", "Stop"),
+        Binding("p", "pause_selected", "Pause"),
+        Binding("R", "restart_selected", "Restart"),
+        Binding("x", "remove_selected", "Remove"),
+        Binding("l", "logs_selected", "Logs"),
+        Binding("L", "logs_follow", "Follow logs"),
+        Binding("/", "focus_filter", "Filter"),
+        Binding("f", "focus_log_filter", "Log filter"),
+        Binding("i", "inspect_selected", "Inspect"),
         Binding("r", "rescan", "Refresh"),
         Binding("q", "quit", "Quit"),
     ]
@@ -78,14 +143,24 @@ class DockerTUI(App):
         self._updating: set[str] = set()
         self._stats: dict[str, tuple] = {}
         self._update_status: dict[str, str] = {}
+        self._recent_update_status: dict[str, str] = {}
+        self._update_outcomes: dict[str, str] = {}
+        self._filter_text = ""
+        self._all_containers: list = []
+        self._log_following = False
+        self._log_filter_text = ""
+        self._log_history: list[tuple[str, str]] = []
         self._stats_in_flight = False
         self._check_in_flight = False
+        self._scan_generation = 0
         self._quitting = False
         self._interval_handles: list = []
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
             Static("D O C K P I T", id="app-title"),
+            Input(placeholder="filter containers", id="container-filter"),
+            Input(placeholder="filter logs", id="log-filter"),
             Static("starting\u2026", id="container-stats"),
             id="app-header",
         )
@@ -97,6 +172,8 @@ class DockerTUI(App):
                 Static("", id="d-image", classes="detail-row"),
                 Static("", id="d-id", classes="detail-row"),
                 Static("", id="d-status", classes="detail-row"),
+                Static("", id="d-health", classes="detail-row"),
+                Static("", id="d-restart", classes="detail-row"),
                 Static("", id="d-created", classes="detail-row"),
                 Static("", id="d-ports", classes="detail-row"),
                 Static("", id="d-stats", classes="detail-row"),
@@ -118,6 +195,7 @@ class DockerTUI(App):
         self.table.cursor_type = "row"
         self.table.add_column("NAME", key="name", width=24)
         self.table.add_column("STATUS", key="status", width=10)
+        self.table.add_column("HEALTH", key="health", width=10)
         self.table.add_column("CPU", key="cpu", width=8)
         self.table.add_column("MEM", key="mem", width=8)
         self.table.add_column("UPD", key="upd", width=5)
@@ -137,7 +215,7 @@ class DockerTUI(App):
             self.push_log("Press r to retry the connection.", GRUVBOX_YELLOW)
             return
         self.push_log(f"Connected to Docker daemon (API {version}).", f"bold {GRUVBOX_GREEN}")
-        self._scan_worker()
+        self._request_scan()
         self.table.focus()
         self._interval_handles.append(self.set_interval(2.0, self._on_stats_timer))
         self._interval_handles.append(self.set_interval(60.0, self._on_update_check_timer))
@@ -150,6 +228,9 @@ class DockerTUI(App):
 
     def on_unmount(self) -> None:
         self._quitting = True
+        self._log_following = False
+        self._stats_in_flight = False
+        self._check_in_flight = False
         for timer in self._interval_handles:
             timer.stop()
         self._interval_handles.clear()
@@ -162,7 +243,12 @@ class DockerTUI(App):
     # --- logging -----------------------------------------------------------
 
     def push_log(self, message: str, style: str = "") -> None:
-        if self.output is None or self._quitting:
+        if self._quitting:
+            return
+        self._log_history.append((message, style))
+        if len(self._log_history) > MAX_LOG_HISTORY:
+            del self._log_history[: len(self._log_history) - MAX_LOG_HISTORY]
+        if self.output is None:
             return
         if self._thread_id == threading.get_ident():
             self._write_log(message, style)
@@ -170,12 +256,35 @@ class DockerTUI(App):
             self.call_from_thread(self._write_log, message, style)
 
     def _write_log(self, message: str, style: str = "") -> None:
-        self.output.write(Text(message, style=style))
+        if self._log_matches_filter(message):
+            self.output.write(Text(message, style=style))
+
+    @on(Input.Changed, "#log-filter")
+    def _on_log_filter_changed(self, event: Input.Changed) -> None:
+        self._log_filter_text = event.value.strip().lower()
+        self._render_log_history()
+
+    def action_focus_log_filter(self) -> None:
+        self.query_one("#log-filter", Input).focus()
+
+    def _log_matches_filter(self, message: str) -> bool:
+        return not self._log_filter_text or self._log_filter_text in message.lower()
+
+    def _render_log_history(self) -> None:
+        if self.output is None:
+            return
+        self.output.clear()
+        for message, style in self._log_history:
+            self._write_log(message, style)
 
     # --- scanning ----------------------------------------------------------
 
+    def _request_scan(self) -> None:
+        self._scan_generation += 1
+        self._scan_worker(self._scan_generation)
+
     @work(thread=True)
-    def _scan_worker(self) -> None:
+    def _scan_worker(self, generation: int) -> None:
         if self.client is None or self._quitting:
             self.push_log("No Docker connection - press r to retry.", f"bold {GRUVBOX_RED}")
             return
@@ -188,16 +297,30 @@ class DockerTUI(App):
             self.push_log(f"Failed to list containers: {exc}", f"bold {GRUVBOX_RED}")
             containers = []
         if not self._quitting:
-            self.call_from_thread(self._populate_table, containers)
+            self.call_from_thread(self._populate_table, containers, generation)
 
-    def _populate_table(self, containers: list) -> None:
+    def _populate_table(
+        self, containers: list, generation: int | None = None, remember: bool = True
+    ) -> None:
+        if (generation is not None and generation != self._scan_generation) or self._quitting:
+            return
+        if remember:
+            self._all_containers = list(containers)
+        containers = [container for container in containers if self._matches_filter(container)]
         prev_selected = self._selected_id if self._selected_id in self._container_by_key else None
         self._container_by_key.clear()
         self._update_status.clear()
+        self._stats = {cid: pair for cid, pair in self._stats.items() if cid in {c.id for c in containers}}
         self.table.clear()
         for container in containers:
             self._add_row(container)
+        for cid, container in self._container_by_key.items():
+            state = self._recent_update_status.get(self._name_of(container))
+            if state:
+                self._update_status[cid] = state
+                self._set_upd_cell(cid, state)
         if not containers:
+            self._selected_id = None
             self._clear_details()
         else:
             if prev_selected:
@@ -208,10 +331,30 @@ class DockerTUI(App):
                 else:
                     self.table.move_cursor(row=0)
             else:
+                self._selected_id = containers[0].id
                 self.table.move_cursor(row=0)
         self._refresh_header()
         self._update_check_tick()
         self._on_stats_timer()
+
+    @on(Input.Changed, "#container-filter")
+    def _on_filter_changed(self, event: Input.Changed) -> None:
+        self._filter_text = event.value.strip().lower()
+        if self._all_containers:
+            self._populate_table(self._all_containers, remember=False)
+
+    def action_focus_filter(self) -> None:
+        self.query_one("#container-filter", Input).focus()
+
+    def _matches_filter(self, container) -> bool:
+        if not self._filter_text:
+            return True
+        attrs = container.attrs
+        name = self._name_of(container)
+        image = (attrs.get("Config") or {}).get("Image") or ""
+        status = container.status or ""
+        haystack = f"{name} {image} {status}".lower()
+        return self._filter_text in haystack
 
     def _add_row(self, container) -> None:
         attrs = container.attrs
@@ -219,15 +362,33 @@ class DockerTUI(App):
         image = (attrs.get("Config") or {}).get("Image") or "?"
         status = container.status or (attrs.get("State") or {}).get("Status") or "unknown"
         status_label, status_color = STATUS_DISPLAY.get(status, (f"? {status}", GRUVBOX_YELLOW))
+        health_text, health_color = self._health_display(attrs)
+        restart = self._restart_policy(attrs)
+        health_label, health_color = self._health_display(attrs)
         self.table.add_row(
             Text(name, style=f"bold {GRUVBOX_FG}"),
             Text(f"{status_label}", style=f"bold {status_color}"),
+            Text(health_label, style=f"bold {health_color}"),
             Text("\u2013", style=GRUVBOX_GRAY),
             Text("\u2013", style=GRUVBOX_GRAY),
             Text("\u2013", style=GRUVBOX_GRAY),
             key=container.id,
         )
         self._container_by_key[container.id] = container
+
+    @staticmethod
+    def _health_display(attrs: dict) -> tuple[str, str]:
+        state = ((attrs.get("State") or {}).get("Health") or {}).get("Status")
+        if state in HEALTH_DISPLAY:
+            return HEALTH_DISPLAY[state]
+        if (attrs.get("Config") or {}).get("Healthcheck"):
+            return "? unknown", GRUVBOX_GRAY
+        return "-", GRUVBOX_GRAY
+
+    @staticmethod
+    def _restart_policy(attrs: dict) -> str:
+        name = ((attrs.get("HostConfig") or {}).get("RestartPolicy") or {}).get("Name")
+        return name or "none"
 
     @staticmethod
     def _format_ports(attrs: dict) -> str:
@@ -251,19 +412,21 @@ class DockerTUI(App):
         if self.client is None or self._check_in_flight or not self._container_by_key:
             return
         self._check_in_flight = True
-        self._update_check_worker()
+        self._update_check_worker(self._scan_generation)
 
     @work(thread=True)
-    def _update_check_worker(self) -> None:
+    def _update_check_worker(self, generation: int) -> None:
         results = {}
         try:
             for cid, container in list(self._container_by_key.items()):
                 if self._quitting:
                     return
                 results[cid] = self._check_update(container)
+        except Exception as exc:
+            self.push_log(f"Update check failed: {exc}", f"bold {GRUVBOX_RED}")
         finally:
             if not self._quitting:
-                self.call_from_thread(self._apply_update_status, results)
+                self.call_from_thread(self._apply_update_status, results, generation)
 
     def _check_update(self, container) -> str:
         if self.client is None:
@@ -300,8 +463,10 @@ class DockerTUI(App):
         except Exception:
             return "unknown"
 
-    def _apply_update_status(self, results: dict) -> None:
+    def _apply_update_status(self, results: dict, generation: int | None = None) -> None:
         self._check_in_flight = False
+        if (generation is not None and generation != self._scan_generation) or self._quitting:
+            return
         self._update_status.update(results)
         for cid, state in results.items():
             if cid not in self._updating:
@@ -316,26 +481,28 @@ class DockerTUI(App):
         if self.client is None or self._stats_in_flight or not self._container_by_key:
             return
         self._stats_in_flight = True
-        self._stats_worker()
+        self._stats_worker(self._scan_generation)
 
     @work(thread=True)
-    def _stats_worker(self) -> None:
+    def _stats_worker(self, generation: int) -> None:
+        snapshot = {}
         if self._quitting:
             return
-        snapshot = {}
-        for cid, container in list(self._container_by_key.items()):
-            if self._quitting:
-                return
-            if container.status != "running":
-                snapshot[cid] = None
-                continue
-            try:
-                sample = container.stats(stream=False)
-                snapshot[cid] = (self._compute_cpu(sample), self._compute_mem(sample))
-            except Exception:
-                snapshot[cid] = None
-        if not self._quitting:
-            self.call_from_thread(self._apply_stats, snapshot)
+        try:
+            for cid, container in list(self._container_by_key.items()):
+                if self._quitting:
+                    return
+                if container.status != "running":
+                    snapshot[cid] = None
+                    continue
+                try:
+                    sample = container.stats(stream=False)
+                    snapshot[cid] = (self._compute_cpu(sample), self._compute_mem(sample))
+                except Exception:
+                    snapshot[cid] = None
+        finally:
+            if not self._quitting:
+                self.call_from_thread(self._apply_stats, snapshot, generation)
 
     @staticmethod
     def _compute_cpu(sample: dict):
@@ -362,8 +529,10 @@ class DockerTUI(App):
             return None
         return (usage / limit) * 100.0
 
-    def _apply_stats(self, snapshot: dict) -> None:
+    def _apply_stats(self, snapshot: dict, generation: int | None = None) -> None:
         self._stats_in_flight = False
+        if (generation is not None and generation != self._scan_generation) or self._quitting:
+            return
         for cid, pair in snapshot.items():
             self._stats[cid] = pair
             cpu = mem = None
@@ -463,6 +632,8 @@ class DockerTUI(App):
         state = self._update_status.get(cid, "unknown")
         state_text, state_color = UPDATE_DISPLAY.get(state, UPDATE_DISPLAY["unknown"])
         status_label, status_color = STATUS_DISPLAY.get(status, (f"? {status}", GRUVBOX_YELLOW))
+        health_text, health_color = self._health_display(attrs)
+        restart = self._restart_policy(attrs)
 
         self._set_detail("d-name", (name, f"bold {GRUVBOX_FG}"))
         self._set_detail(
@@ -476,6 +647,8 @@ class DockerTUI(App):
             ("STATUS ", GRUVBOX_GRAY),
             (status_label, f"bold {status_color}"),
         )
+        self._set_detail("d-health", ("HEALTH ", GRUVBOX_GRAY), (health_text, f"bold {health_color}"))
+        self._set_detail("d-restart", ("RESTART", GRUVBOX_GRAY), (restart, GRUVBOX_FG))
         self._set_detail("d-created", ("UP     ", GRUVBOX_GRAY), (self._fmt_created(created), GRUVBOX_FG))
         self._set_detail("d-ports", ("PORTS  ", GRUVBOX_GRAY), (ports, GRUVBOX_FG))
         self._set_detail("d-stats", (self._stats_block(cpu, mem, cpu_text, mem_text), ""))
@@ -534,7 +707,7 @@ class DockerTUI(App):
 
     def action_rescan(self) -> None:
         self.push_log("Rescanning host containers\u2026", GRUVBOX_ORANGE)
-        self._scan_worker()
+        self._request_scan()
 
     def action_update_selected(self) -> None:
         cid = self._selected_id
@@ -548,9 +721,11 @@ class DockerTUI(App):
         if cid in self._updating:
             self.push_log("Container is already being updated.", GRUVBOX_YELLOW)
             return
-        self._updating.add(cid)
-        self._set_upd_cell(cid, "updating")
-        self._update_worker(self._container_by_key[cid])
+        container = self._container_by_key[cid]
+        self._confirm_action(
+            f"Replace '{self._name_of(container)}' with the latest image?",
+            lambda confirmed: self._start_update(container, confirmed),
+        )
 
     def action_update_all(self) -> None:
         targets = [
@@ -562,11 +737,169 @@ class DockerTUI(App):
             self.push_log("No containers with available updates.", GRUVBOX_YELLOW)
             return
         names = ", ".join(self._name_of(c) for c in targets)
+        self._confirm_action(
+            f"Update {len(targets)} container(s): {names}?",
+            lambda confirmed: self._start_update_all(targets, confirmed),
+        )
+
+    def _confirm_action(self, message: str, callback) -> None:
+        self.push_screen(ConfirmScreen(message), callback)
+
+    def _start_update(self, container, confirmed: bool) -> None:
+        if not confirmed:
+            self.push_log("Update cancelled.", GRUVBOX_GRAY)
+            return
+        cid = container.id
+        self._updating.add(cid)
+        self._set_upd_cell(cid, "updating")
+        self._update_worker(container)
+
+    def _start_update_all(self, targets: list, confirmed: bool) -> None:
+        if not confirmed:
+            self.push_log("Update-all cancelled.", GRUVBOX_GRAY)
+            return
+        names = ", ".join(self._name_of(c) for c in targets)
         self.push_log(f"Updating {len(targets)} container(s): {names}", f"bold {GRUVBOX_ORANGE}")
         for container in targets:
             self._updating.add(container.id)
             self._set_upd_cell(container.id, "updating")
         self._update_all_worker(targets)
+
+    def action_start_selected(self) -> None:
+        self._run_lifecycle_action("start")
+
+    def action_stop_selected(self) -> None:
+        self._run_lifecycle_action("stop")
+
+    def action_pause_selected(self) -> None:
+        self._run_lifecycle_action("pause")
+
+    def action_remove_selected(self) -> None:
+        self._run_lifecycle_action("remove")
+
+    def action_restart_selected(self) -> None:
+        self._run_lifecycle_action("restart")
+
+    def _run_lifecycle_action(self, operation: str) -> None:
+        container = self._selected_container()
+        if container is None:
+            self.push_log("No container selected.", GRUVBOX_YELLOW)
+            return
+        if container.id in self._updating:
+            self.push_log("Container is already being updated.", GRUVBOX_YELLOW)
+            return
+        if operation in {"stop", "pause", "remove"}:
+            verb = {"stop": "Stop", "pause": "Pause", "remove": "Remove"}[operation]
+            self._confirm_action(
+                f"{verb} '{self._name_of(container)}'?",
+                lambda confirmed: self._start_lifecycle(container, operation, confirmed),
+            )
+            return
+        self._start_lifecycle(container, operation, True)
+
+    def _start_lifecycle(self, container, operation: str, confirmed: bool) -> None:
+        if not confirmed:
+            self.push_log(f"{operation.capitalize()} cancelled.", GRUVBOX_GRAY)
+            return
+        self._lifecycle_worker(container, operation)
+
+    def _selected_container(self):
+        if self._selected_id is None:
+            return None
+        return self._container_by_key.get(self._selected_id)
+
+    @work(thread=True)
+    def _lifecycle_worker(self, container, operation: str) -> None:
+        name = self._name_of(container)
+        present = {
+            "start": "Starting", "stop": "Stopping", "pause": "Pausing", "restart": "Restarting", "remove": "Removing"
+        }[operation]
+        past = {"start": "started", "stop": "stopped", "pause": "paused", "restart": "restarted", "remove": "removed"}[operation]
+        try:
+            self.push_log(f"{present} '{name}'...", GRUVBOX_ORANGE)
+            getattr(container, operation)()
+            self.push_log(f"Container '{name}' {past}.", f"bold {GRUVBOX_GREEN}")
+        except Exception as exc:
+            self.push_log(f"Could not {operation} '{name}': {exc}", f"bold {GRUVBOX_RED}")
+        finally:
+            if not self._quitting:
+                self.call_from_thread(self._request_scan)
+
+    def action_logs_selected(self) -> None:
+        container = self._selected_container()
+        if container is None:
+            self.push_log("No container selected.", GRUVBOX_YELLOW)
+            return
+        self._logs_worker(container)
+
+    def action_inspect_selected(self) -> None:
+        container = self._selected_container()
+        if container is None:
+            self.push_log("No container selected.", GRUVBOX_YELLOW)
+            return
+        self._inspect_worker(container)
+
+    @work(thread=True)
+    def _inspect_worker(self, container) -> None:
+        name = self._name_of(container)
+        try:
+            self.push_log(f"--- inspect: {name} ---", f"bold {GRUVBOX_YELLOW}")
+            for line in self._format_inspect(container.attrs):
+                self.push_log(line, GRUVBOX_FG)
+        except Exception as exc:
+            self.push_log(f"Could not inspect '{name}': {exc}", f"bold {GRUVBOX_RED}")
+
+    @staticmethod
+    def _format_inspect(attrs: dict) -> list[str]:
+        return json.dumps(attrs, indent=2, sort_keys=True, default=str).splitlines()
+
+    def action_logs_follow(self) -> None:
+        if self._log_following:
+            self._log_following = False
+            self.push_log("Stopping log follow.", GRUVBOX_GRAY)
+            return
+        container = self._selected_container()
+        if container is None:
+            self.push_log("No container selected.", GRUVBOX_YELLOW)
+            return
+        self._log_following = True
+        self._logs_follow_worker(container)
+
+    @work(thread=True)
+    def _logs_worker(self, container) -> None:
+        name = self._name_of(container)
+        try:
+            self.push_log(f"--- recent logs: {name} ---", f"bold {GRUVBOX_YELLOW}")
+            output = container.logs(tail=100, timestamps=True)
+            lines = self._log_lines(output)
+            if not lines:
+                self.push_log("(no log output)", GRUVBOX_GRAY)
+            for line in lines:
+                self.push_log(line, GRUVBOX_FG)
+        except Exception as exc:
+            self.push_log(f"Could not read logs for '{name}': {exc}", f"bold {GRUVBOX_RED}")
+
+    @work(thread=True)
+    def _logs_follow_worker(self, container) -> None:
+        name = self._name_of(container)
+        try:
+            self.push_log(f"--- following logs: {name} ---", f"bold {GRUVBOX_YELLOW}")
+            stream = container.logs(stream=True, follow=True, tail=0, timestamps=True)
+            for chunk in stream:
+                if not self._log_following or self._quitting:
+                    break
+                for line in self._log_lines(chunk):
+                    self.push_log(line, GRUVBOX_FG)
+        except Exception as exc:
+            self.push_log(f"Could not follow logs for '{name}': {exc}", f"bold {GRUVBOX_RED}")
+        finally:
+            self._log_following = False
+
+    @staticmethod
+    def _log_lines(output) -> list[str]:
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        return str(output).splitlines()
 
     def _update_for_key(self, row_key) -> None:
         container = self._container_by_key.get(self._key_value(row_key))
@@ -594,16 +927,22 @@ class DockerTUI(App):
 
     @work(thread=True)
     def _update_worker(self, container) -> None:
-        self._do_update(container)
+        succeeded = self._do_update(container)
         if not self._quitting:
-            self.call_from_thread(self._scan_worker)
+            state = self._update_outcomes.pop(container.id, "up-to-date" if succeeded else "failed")
+            self.call_from_thread(self._apply_update_outcome, self._name_of(container), state)
+            self.call_from_thread(self._request_scan)
 
     @work(thread=True)
     def _update_all_worker(self, targets: list) -> None:
         ok = 0
         failed = 0
         for container in targets:
-            if self._do_update(container):
+            succeeded = self._do_update(container)
+            state = self._update_outcomes.pop(container.id, "up-to-date" if succeeded else "failed")
+            if not self._quitting:
+                self.call_from_thread(self._apply_update_outcome, self._name_of(container), state)
+            if succeeded:
                 ok += 1
             else:
                 failed += 1
@@ -612,11 +951,38 @@ class DockerTUI(App):
                 f"Update-all finished: {ok} updated, {failed} failed.",
                 f"bold {GRUVBOX_GREEN if failed == 0 else GRUVBOX_ORANGE}",
             )
-            self.call_from_thread(self._scan_worker)
+            self.call_from_thread(self._request_scan)
+
+    def _apply_update_outcome(self, name: str, state: str) -> None:
+        self._recent_update_status[name] = state
+        for cid, container in self._container_by_key.items():
+            if self._name_of(container) == name:
+                self._update_status[cid] = state
+                self._set_upd_cell(cid, state)
+        if self._selected_id in self._container_by_key:
+            self._update_details(self._selected_id)
+        self._refresh_header()
+
+    def _publish_update_stage(self, name: str, state: str) -> None:
+        if self.table is not None and not self._quitting:
+            self.call_from_thread(self._apply_update_stage, name, state)
+
+    def _apply_update_stage(self, name: str, state: str) -> None:
+        for cid, container in self._container_by_key.items():
+            if self._name_of(container) == name:
+                self._update_status[cid] = state
+                self._set_upd_cell(cid, state)
+        if self._selected_id in self._container_by_key:
+            self._update_details(self._selected_id)
 
     def _do_update(self, container) -> bool:
         cid = container.id
         name = self._name_of(container)
+        removed = False
+        degraded = False
+        run_kwargs = None
+        original_image = None
+        self._update_outcomes[cid] = "failed"
         try:
             if self.client is None:
                 raise RuntimeError("No Docker connection.")
@@ -626,7 +992,17 @@ class DockerTUI(App):
             image_ref = (attrs.get("Config") or {}).get("Image") or ""
             if not image_ref:
                 raise RuntimeError("Container has no image reference; cannot update.")
+            try:
+                original_image = container.image.id
+            except Exception:
+                original_image = None
+            run_kwargs, secondary_networks = self._build_run_kwargs(attrs)
+            unsupported = self._unsupported_settings(attrs)
+            if unsupported:
+                fields = ", ".join(unsupported)
+                raise RuntimeError(f"unsupported configuration: {fields}")
 
+            self._publish_update_stage(name, "pulling")
             self.push_log(f"Pulling latest image: {image_ref}", GRUVBOX_ORANGE)
             try:
                 self.client.images.pull(image_ref)
@@ -634,21 +1010,33 @@ class DockerTUI(App):
             except docker.errors.NotFound as exc:
                 self.push_log(f"Pull failed ({exc}); continuing with local image.", GRUVBOX_YELLOW)
 
+            self._publish_update_stage(name, "stopping")
             self.push_log("Stopping container\u2026", GRUVBOX_ORANGE)
             container.stop(timeout=15)
+            self._publish_update_stage(name, "removing")
             self.push_log("Removing container\u2026", GRUVBOX_ORANGE)
             container.remove()
+            removed = True
 
-            kwargs, secondary_networks = self._build_run_kwargs(attrs)
+            self._publish_update_stage(name, "recreating")
             self.push_log("Recreating container\u2026", GRUVBOX_ORANGE)
-            new_container = self.client.containers.run(**kwargs)
+            new_container = self.client.containers.run(**run_kwargs)
+            self._publish_update_stage(name, "restoring")
             for net_name, aliases in secondary_networks.items():
                 try:
                     network = self.client.networks.get(net_name)
                     network.connect(new_container, aliases=aliases or None)
                     self.push_log(f"Attached to network '{net_name}'.", GRUVBOX_ORANGE)
                 except Exception as exc:
+                    degraded = True
                     self.push_log(f"Warning re-attaching network '{net_name}': {exc}", GRUVBOX_YELLOW)
+            if degraded:
+                self._update_outcomes[cid] = "degraded"
+                self.push_log(
+                    f"Container '{name}' updated with incomplete network restoration.",
+                    f"bold {GRUVBOX_ORANGE}",
+                )
+                return False
             self.push_log(
                 f"Container recreated successfully! '{self._name_of(new_container)}' "
                 f"({new_container.short_id}).",
@@ -657,6 +1045,22 @@ class DockerTUI(App):
             return True
         except Exception as exc:
             self.push_log(f"Update failed for '{name}': {exc}", f"bold {GRUVBOX_RED}")
+            if removed and run_kwargs is not None:
+                rollback_kwargs = dict(run_kwargs)
+                rollback_kwargs["image"] = original_image or image_ref
+                try:
+                    self.push_log(f"Attempting recovery of '{name}'…", GRUVBOX_YELLOW)
+                    restored = self.client.containers.run(**rollback_kwargs)
+                    self.push_log(
+                        f"Recovery succeeded for '{name}' ({restored.short_id}).",
+                        f"bold {GRUVBOX_GREEN}",
+                    )
+                    self._update_outcomes[cid] = "recovered"
+                except Exception as recovery_exc:
+                    self.push_log(
+                        f"Recovery failed for '{name}': {recovery_exc}",
+                        f"bold {GRUVBOX_RED}",
+                    )
             return False
         finally:
             self._updating.discard(cid)
@@ -681,6 +1085,22 @@ class DockerTUI(App):
             kwargs["entrypoint"] = config["Entrypoint"]
         if config.get("WorkingDir"):
             kwargs["working_dir"] = config["WorkingDir"]
+        for config_key, run_key in (
+            ("User", "user"),
+            ("Hostname", "hostname"),
+            ("Healthcheck", "healthcheck"),
+        ):
+            if config_key in config and config[config_key] is not None:
+                kwargs[run_key] = config[config_key]
+        for config_key, run_key in (
+            ("Tty", "tty"),
+            ("OpenStdin", "stdin_open"),
+            ("Privileged", "privileged"),
+            ("StopSignal", "stop_signal"),
+            ("StopTimeout", "stop_timeout"),
+        ):
+            if config_key in config:
+                kwargs[run_key] = config[config_key]
 
         env = self._parse_env(config.get("Env"))
         if env:
@@ -694,13 +1114,53 @@ class DockerTUI(App):
         if ports:
             kwargs["ports"] = ports
 
-        volumes = self._parse_binds(host.get("Binds"))
+        mounts = attrs.get("Mounts")
+        volumes = self._parse_mounts(mounts) if mounts is not None else self._parse_binds(host.get("Binds"))
         if volumes:
             kwargs["volumes"] = volumes
 
         restart = host.get("RestartPolicy")
         if restart and restart.get("Name"):
             kwargs["restart_policy"] = restart
+        for host_key, run_key in (
+            ("CapAdd", "cap_add"),
+            ("CapDrop", "cap_drop"),
+            ("Devices", "devices"),
+            ("Dns", "dns"),
+            ("ExtraHosts", "extra_hosts"),
+            ("Tmpfs", "tmpfs"),
+        ):
+            if host_key in host and host[host_key] is not None:
+                kwargs[run_key] = host[host_key]
+        for host_key, run_key in (
+            ("Memory", "mem_limit"),
+            ("MemorySwap", "memswap_limit"),
+            ("CpuShares", "cpu_shares"),
+            ("CpuPeriod", "cpu_period"),
+            ("CpuQuota", "cpu_quota"),
+            ("CpusetCpus", "cpuset_cpus"),
+            ("BlkioWeight", "blkio_weight"),
+            ("PidsLimit", "pids_limit"),
+            ("Ulimits", "ulimits"),
+            ("ShmSize", "shm_size"),
+            ("SecurityOpt", "security_opt"),
+            ("UsernsMode", "userns_mode"),
+            ("IpcMode", "ipc_mode"),
+            ("LogConfig", "log_config"),
+            ("Sysctls", "sysctls"),
+            ("Init", "init"),
+            ("AutoRemove", "auto_remove"),
+            ("CgroupnsMode", "cgroupns"),
+            ("Runtime", "runtime"),
+            ("GroupAdd", "group_add"),
+            ("OomKillDisable", "oom_kill_disable"),
+            ("OomScoreAdj", "oom_score_adj"),
+            ("ReadonlyRootfs", "read_only"),
+            ("StorageOpt", "storage_opt"),
+            ("VolumeDriver", "volume_driver"),
+        ):
+            if host_key in host and host[host_key] is not None:
+                kwargs[run_key] = host[host_key]
 
         # Networking: attach to the container's first network at create time,
         # then re-attach the remaining ones (with their aliases) afterwards so
@@ -716,6 +1176,19 @@ class DockerTUI(App):
             kwargs["network_mode"] = host_mode
 
         return kwargs, secondary
+
+    @staticmethod
+    def _unsupported_settings(attrs: dict) -> list[str]:
+        config = attrs.get("Config") or {}
+        host = attrs.get("HostConfig") or {}
+        unsupported = []
+        if config.get("Secrets"):
+            unsupported.append("Config.Secrets")
+        if config.get("Configs"):
+            unsupported.append("Config.Configs")
+        if host.get("SecretReferences"):
+            unsupported.append("HostConfig.SecretReferences")
+        return unsupported
 
     @staticmethod
     def _parse_env(env_list) -> dict:
@@ -749,6 +1222,18 @@ class DockerTUI(App):
                 target, mode = parts[-2], parts[-1]
             else:
                 continue
+            result[source] = {"bind": target, "mode": mode}
+        return result
+
+    @staticmethod
+    def _parse_mounts(mounts) -> dict:
+        result = {}
+        for mount in mounts or []:
+            source = mount.get("Name") or mount.get("Source")
+            target = mount.get("Destination")
+            if not source or not target:
+                continue
+            mode = mount.get("Mode") or ("rw" if mount.get("RW", True) else "ro")
             result[source] = {"bind": target, "mode": mode}
         return result
 
