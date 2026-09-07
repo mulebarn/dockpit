@@ -1,7 +1,6 @@
 """DOCKPIT - a btop/htop-inspired Docker container manager built with Textual."""
 
 import threading
-from collections import deque
 from datetime import datetime, timezone
 
 import docker
@@ -43,14 +42,6 @@ UPDATE_DISPLAY = {
 UPDATE_GLYPH = {key: value[0].split()[0] for key, value in UPDATE_DISPLAY.items()}
 UPDATE_COLOR = {key: value[1] for key, value in UPDATE_DISPLAY.items()}
 
-DOCKPIT_BANNER = """\u2588   \u2588  \u2588\u2588\u2588   \u2588\u2588\u2588  \u2588  \u2588 \u2588\u2588\u2588\u2588  \u2588\u2588\u2588  \u2588\u2588\u2588\u2588\u2588
-\u2588\u2588  \u2588 \u2588   \u2588 \u2588     \u2588 \u2588  \u2588  \u2588  \u2588     \u2588  
-\u2588 \u2588 \u2588 \u2588   \u2588 \u2588     \u2588\u2588   \u2588  \u2588  \u2588     \u2588  
-\u2588  \u2588\u2588 \u2588   \u2588 \u2588     \u2588\u2588   \u2588\u2588\u2588\u2588   \u2588     \u2588  
-\u2588   \u2588 \u2588   \u2588 \u2588     \u2588 \u2588  \u2588      \u2588     \u2588  
-\u2588   \u2588  \u2588\u2588\u2588   \u2588\u2588\u2588  \u2588  \u2588 \u2588     \u2588\u2588\u2588    \u2588  
-""".strip("\n")
-
 DETAIL_IDS = (
     "d-name",
     "d-image",
@@ -59,7 +50,6 @@ DETAIL_IDS = (
     "d-created",
     "d-ports",
     "d-stats",
-    "d-spark",
     "d-update",
 )
 
@@ -88,18 +78,13 @@ class DockerTUI(App):
         self._updating: set[str] = set()
         self._stats: dict[str, tuple] = {}
         self._update_status: dict[str, str] = {}
-        self._history: dict[str, dict] = {}
         self._stats_in_flight = False
         self._check_in_flight = False
 
     def compose(self) -> ComposeResult:
-        yield Vertical(
-            Horizontal(
-                Static("DOCKPIT", id="app-title"),
-                Static("starting\u2026", id="container-stats"),
-                id="app-header-top",
-            ),
-            Static(DOCKPIT_BANNER, id="app-banner"),
+        yield Horizontal(
+            Static("D O C K P I T", id="app-title"),
+            Static("starting\u2026", id="container-stats"),
             id="app-header",
         )
         yield Horizontal(
@@ -113,7 +98,6 @@ class DockerTUI(App):
                 Static("", id="d-created", classes="detail-row"),
                 Static("", id="d-ports", classes="detail-row"),
                 Static("", id="d-stats", classes="detail-row"),
-                Static("", id="d-spark", classes="detail-row"),
                 Static("", id="d-update", classes="detail-row"),
                 id="details",
             ),
@@ -132,8 +116,8 @@ class DockerTUI(App):
         self.table.cursor_type = "row"
         self.table.add_column("NAME", key="name", width=24)
         self.table.add_column("STATUS", key="status", width=10)
-        self.table.add_column("CPU", key="cpu", width=14)
-        self.table.add_column("MEM", key="mem", width=14)
+        self.table.add_column("CPU", key="cpu", width=8)
+        self.table.add_column("MEM", key="mem", width=8)
         self.table.add_column("UPD", key="upd", width=5)
         self.push_log("Welcome to DOCKPIT.", f"bold {GRUVBOX_YELLOW}")
         try:
@@ -357,22 +341,19 @@ class DockerTUI(App):
             cpu = mem = None
             if pair is not None:
                 cpu, mem = pair
-            self._record_stats(cid, cpu, mem)
             try:
-                self.table.update_cell(cid, "cpu", self._gauge_pct(cpu, width=8))
-                self.table.update_cell(cid, "mem", self._gauge_pct(mem, width=8))
+                self.table.update_cell(cid, "cpu", self._pct_cell(cpu))
+                self.table.update_cell(cid, "mem", self._pct_cell(mem))
             except Exception:
                 pass
         if self._selected_id in self._container_by_key:
             self._update_details(self._selected_id)
         self._refresh_header()
 
-    def _record_stats(self, cid: str, cpu: float | None, mem: float | None) -> None:
-        history = self._history.setdefault(cid, {"cpu": deque(maxlen=10), "mem": deque(maxlen=10)})
-        if cpu is not None:
-            history["cpu"].append(cpu)
-        if mem is not None:
-            history["mem"].append(mem)
+    def _pct_cell(self, value: float | None) -> Text:
+        if value is None:
+            return Text("\u2013", style=f"bold {GRUVBOX_GRAY}")
+        return Text(self._format_pct(value), style=f"bold {self._pct_color(value)}")
 
     @staticmethod
     def _format_pct(value: float) -> str:
@@ -389,25 +370,12 @@ class DockerTUI(App):
     def _gauge_pct(self, value: float | None, width: int = 10) -> Text:
         text = Text()
         if value is None:
-            text.append(f"{self._gauge(value, width)}  \u2013", style=GRUVBOX_GRAY)
+            text.append(f"[{self._gauge(value, width)}]  \u2013", style=GRUVBOX_GRAY)
             return text
         color = f"bold {self._pct_color(value)}"
-        text.append(self._gauge(value, width), style=color)
+        text.append(f"[{self._gauge(value, width)}]", style=color)
         text.append(f" {self._format_pct(value)}", style=color)
         return text
-
-    @staticmethod
-    def _sparkline(values, width: int = 10) -> str:
-        vals = list(values)
-        if not vals:
-            return "\u2591" * width
-        lo, hi = min(vals), max(vals)
-        span = hi - lo or 1.0
-        chars = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
-        line = "".join(chars[min(len(chars) - 1, int((v - lo) / span * len(chars)))] for v in vals)
-        if len(line) < width:
-            line += "\u2591" * (width - len(line))
-        return line[:width]
 
     @staticmethod
     def _pct_color(value: float | None) -> str:
@@ -467,7 +435,6 @@ class DockerTUI(App):
         state = self._update_status.get(cid, "unknown")
         state_text, state_color = UPDATE_DISPLAY.get(state, UPDATE_DISPLAY["unknown"])
         status_label, status_color = STATUS_DISPLAY.get(status, (f"? {status}", GRUVBOX_YELLOW))
-        history = self._history.get(cid)
 
         self._set_detail("d-name", (name, f"bold {GRUVBOX_FG}"))
         self._set_detail(
@@ -483,27 +450,27 @@ class DockerTUI(App):
         )
         self._set_detail("d-created", ("UP     ", GRUVBOX_GRAY), (self._fmt_created(created), GRUVBOX_FG))
         self._set_detail("d-ports", ("PORTS  ", GRUVBOX_GRAY), (ports, GRUVBOX_FG))
-        self._set_detail(
-            "d-stats",
-            ("CPU ", GRUVBOX_GRAY),
-            (self._gauge(cpu, width=10), f"bold {self._pct_color(cpu)}"),
-            (f" {cpu_text}  MEM ", GRUVBOX_GRAY),
-            (self._gauge(mem, width=10), f"bold {self._pct_color(mem)}"),
-            (f" {mem_text}", f"bold {self._pct_color(mem)}"),
-        )
-        self._set_detail(
-            "d-spark",
-            ("CPU ", GRUVBOX_GRAY),
-            (self._sparkline((history or {}).get("cpu", [])), f"bold {GRUVBOX_AQUA}"),
-            ("  MEM ", GRUVBOX_GRAY),
-            (self._sparkline((history or {}).get("mem", [])), f"bold {GRUVBOX_AQUA}"),
-        )
+        self._set_detail("d-stats", (self._stats_block(cpu, mem, cpu_text, mem_text), ""))
         self._set_detail("d-update", ("UPDATE ", GRUVBOX_GRAY), (state_text, f"bold {state_color}"))
+
+    def _stats_block(self, cpu: float | None, mem: float | None, cpu_text: str, mem_text: str) -> Text:
+        text = Text()
+        for label, value, display in (("CPU", cpu, cpu_text), ("MEM", mem, mem_text)):
+            color = f"bold {self._pct_color(value)}"
+            text.append(f"{label} [", style=GRUVBOX_GRAY)
+            text.append(self._gauge(value, width=10), style=color)
+            text.append("]  ", style=GRUVBOX_GRAY)
+            text.append(display, style=color)
+            text.append("\n", style=GRUVBOX_GRAY)
+        return text
 
     def _set_detail(self, widget_id: str, *parts) -> None:
         text = Text()
         for content, style in parts:
-            text.append(str(content), style=style)
+            if isinstance(content, Text):
+                text.append(content)
+            else:
+                text.append(str(content), style=style)
         self.query_one(f"#{widget_id}", Static).update(text)
 
     @staticmethod

@@ -11,13 +11,8 @@ Screen {
     padding: 0 1;
 }
 
-#app-header-top {
-    height: 1;
-    width: 100%;
-}
-
 #app-title {
-    color: #fabd2f;
+    color: #fe8019;
     text-style: bold;
     content-align: left middle;
     width: 1fr;
@@ -29,17 +24,7 @@ Screen {
     text-style: bold;
     content-align: right middle;
     width: auto;
-    padding: 0 2;
-}
-
-#app-banner {
-    color: #fe8019;
-    text-style: bold;
-    background: #282828;
-    content-align: center middle;
-    width: 100%;
-    height: auto;
-    padding: 0 1;
+    padding: 0 3 0 1;
 }
 
 #main {
