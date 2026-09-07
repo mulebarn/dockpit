@@ -1,6 +1,7 @@
 """DOCKPIT - a btop/htop-inspired Docker container manager built with Textual."""
 
 import json
+import os
 import threading
 from datetime import datetime, timezone
 
@@ -26,6 +27,9 @@ GRUVBOX_GREEN = "#b8bb26"
 GRUVBOX_RED = "#fb4934"
 GRUVBOX_AQUA = "#8ec07c"
 MAX_LOG_HISTORY = 5000
+MAX_RESOURCE_HISTORY = 30
+DEFAULT_STATS_INTERVAL = 2.0
+DEFAULT_REGISTRY_INTERVAL = 60.0
 
 STATUS_DISPLAY = {
     "running": ("\u25cf running", GRUVBOX_GREEN),
@@ -39,6 +43,7 @@ UPDATE_DISPLAY = {
     "update": ("\u25b2 update avail", GRUVBOX_ORANGE),
     "up-to-date": ("\u2714 current", GRUVBOX_GREEN),
     "local": ("\u00b7 local only", GRUVBOX_GRAY),
+    "registry-error": ("! registry error", GRUVBOX_RED),
     "unknown": ("? unknown", GRUVBOX_GRAY),
     "updating": ("\u21bb updating", GRUVBOX_AQUA),
     "pulling": ("\u21bb pulling", GRUVBOX_AQUA),
@@ -142,6 +147,7 @@ class DockerTUI(App):
         self._selected_id: str | None = None
         self._updating: set[str] = set()
         self._stats: dict[str, tuple] = {}
+        self._resource_history: dict[str, list[tuple[float | None, float | None]]] = {}
         self._update_status: dict[str, str] = {}
         self._recent_update_status: dict[str, str] = {}
         self._update_outcomes: dict[str, str] = {}
@@ -153,8 +159,21 @@ class DockerTUI(App):
         self._stats_in_flight = False
         self._check_in_flight = False
         self._scan_generation = 0
+        self._docker_state = "starting"
         self._quitting = False
         self._interval_handles: list = []
+        self._stats_interval = self._read_interval("DOCKPIT_STATS_INTERVAL", DEFAULT_STATS_INTERVAL)
+        self._registry_interval = self._read_interval(
+            "DOCKPIT_REGISTRY_INTERVAL", DEFAULT_REGISTRY_INTERVAL
+        )
+
+    @staticmethod
+    def _read_interval(name: str, default: float) -> float:
+        try:
+            value = float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
 
     def compose(self) -> ComposeResult:
         yield Horizontal(
@@ -203,8 +222,10 @@ class DockerTUI(App):
         try:
             self.client = docker.from_env(timeout=30)
             version = (self.client.version() or {}).get("Version", "?")
+            self._docker_state = "connected"
         except Exception as exc:
             self.client = None
+            self._docker_state = "unavailable"
             self.push_log(f"Docker connection failed: {exc}", f"bold {GRUVBOX_RED}")
             if "permission denied" in str(exc).lower():
                 self.push_log(
@@ -217,8 +238,8 @@ class DockerTUI(App):
         self.push_log(f"Connected to Docker daemon (API {version}).", f"bold {GRUVBOX_GREEN}")
         self._request_scan()
         self.table.focus()
-        self._interval_handles.append(self.set_interval(2.0, self._on_stats_timer))
-        self._interval_handles.append(self.set_interval(60.0, self._on_update_check_timer))
+        self._interval_handles.append(self.set_interval(self._stats_interval, self._on_stats_timer))
+        self._interval_handles.append(self.set_interval(self._registry_interval, self._on_update_check_timer))
 
     # --- shutdown ----------------------------------------------------------
 
@@ -285,17 +306,33 @@ class DockerTUI(App):
 
     @work(thread=True)
     def _scan_worker(self, generation: int) -> None:
-        if self.client is None or self._quitting:
-            self.push_log("No Docker connection - press r to retry.", f"bold {GRUVBOX_RED}")
+        if self._quitting:
             return
+        if self.client is None:
+            try:
+                self.client = docker.from_env(timeout=30)
+                version = (self.client.version() or {}).get("Version", "?")
+                self._docker_state = "connected"
+                self.push_log(f"Connected to Docker daemon (API {version}).", f"bold {GRUVBOX_GREEN}")
+            except Exception as exc:
+                self._docker_state = "unavailable"
+                self.push_log(f"Docker unavailable: {exc}", f"bold {GRUVBOX_RED}")
+                if not self._quitting:
+                    self.call_from_thread(self._refresh_header)
+                return
         try:
             containers = sorted(
                 self.client.containers.list(all=True),
                 key=lambda c: (c.status != "running", (c.name or c.id).lstrip("/")),
             )
         except Exception as exc:
-            self.push_log(f"Failed to list containers: {exc}", f"bold {GRUVBOX_RED}")
-            containers = []
+            self._docker_state = "unavailable"
+            self.client = None
+            self.push_log(f"Docker unavailable: {exc}", f"bold {GRUVBOX_RED}")
+            if not self._quitting:
+                self.call_from_thread(self._refresh_header)
+            return
+        self._docker_state = "connected"
         if not self._quitting:
             self.call_from_thread(self._populate_table, containers, generation)
 
@@ -311,6 +348,9 @@ class DockerTUI(App):
         self._container_by_key.clear()
         self._update_status.clear()
         self._stats = {cid: pair for cid, pair in self._stats.items() if cid in {c.id for c in containers}}
+        self._resource_history = {
+            cid: history for cid, history in self._resource_history.items() if cid in {c.id for c in containers}
+        }
         self.table.clear()
         for container in containers:
             self._add_row(container)
@@ -453,7 +493,11 @@ class DockerTUI(App):
             local = repo_digests[0].rsplit("@", 1)[-1]
             if not local.startswith("sha256:"):
                 return "unknown"
-            data = self.client.images.get_registry_data(ref)
+            try:
+                data = self.client.images.get_registry_data(ref)
+            except Exception as exc:
+                self.push_log(f"Registry check failed for '{ref}': {exc}", GRUVBOX_YELLOW)
+                return "registry-error"
             attrs = getattr(data, "attrs", None) or {}
             descriptor = attrs.get("Descriptor") or {}
             remote = descriptor.get("digest") or attrs.get("Digest")
@@ -500,6 +544,8 @@ class DockerTUI(App):
                     snapshot[cid] = (self._compute_cpu(sample), self._compute_mem(sample))
                 except Exception:
                     snapshot[cid] = None
+        except Exception as exc:
+            self.push_log(f"Stats polling failed: {exc}", f"bold {GRUVBOX_YELLOW}")
         finally:
             if not self._quitting:
                 self.call_from_thread(self._apply_stats, snapshot, generation)
@@ -535,6 +581,10 @@ class DockerTUI(App):
             return
         for cid, pair in snapshot.items():
             self._stats[cid] = pair
+            history = self._resource_history.setdefault(cid, [])
+            history.append(pair or (None, None))
+            if len(history) > MAX_RESOURCE_HISTORY:
+                del history[: len(history) - MAX_RESOURCE_HISTORY]
             cpu = mem = None
             if pair is not None:
                 cpu, mem = pair
@@ -584,9 +634,22 @@ class DockerTUI(App):
             return GRUVBOX_YELLOW
         return GRUVBOX_GREEN
 
+    @staticmethod
+    def _sparkline(values: list[float | None], width: int = 12) -> str:
+        points = [value for value in values if value is not None]
+        if not points:
+            return "\u00b7" * width
+        recent = points[-width:]
+        levels = "\u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+        result = "\u00b7" * max(0, width - len(recent))
+        result += "".join(levels[min(len(levels) - 1, round(max(0.0, min(100.0, value)) / 100 * (len(levels) - 1)))] for value in recent)
+        return result
+
     # --- header ------------------------------------------------------------
 
     def _refresh_header(self) -> None:
+        if self.stats is None:
+            return
         items = list(self._container_by_key.values())
         running = sum(1 for c in items if c.status == "running")
         updates = sum(1 for state in self._update_status.values() if state == "update")
@@ -605,6 +668,8 @@ class DockerTUI(App):
         header.append(self._gauge_pct(avg_cpu, width=6))
         header.append("  MEM ", style="bold")
         header.append(self._gauge_pct(avg_mem, width=6))
+        if self._docker_state == "unavailable":
+            header.append("  DOCKER UNAVAILABLE - press r", style=f"bold {GRUVBOX_RED}")
         self.stats.update(header)
 
     # --- details panel -----------------------------------------------------
@@ -627,6 +692,7 @@ class DockerTUI(App):
         created = (attrs.get("Created") or "").strip()
         ports = self._format_ports(attrs) or "none published"
         cpu, mem = self._stats.get(cid) or (None, None)
+        history = self._resource_history.get(cid, [])
         cpu_text = "\u2013" if cpu is None else f"{cpu:.1f}%"
         mem_text = "\u2013" if mem is None else self._format_pct(mem)
         state = self._update_status.get(cid, "unknown")
@@ -651,10 +717,17 @@ class DockerTUI(App):
         self._set_detail("d-restart", ("RESTART", GRUVBOX_GRAY), (restart, GRUVBOX_FG))
         self._set_detail("d-created", ("UP     ", GRUVBOX_GRAY), (self._fmt_created(created), GRUVBOX_FG))
         self._set_detail("d-ports", ("PORTS  ", GRUVBOX_GRAY), (ports, GRUVBOX_FG))
-        self._set_detail("d-stats", (self._stats_block(cpu, mem, cpu_text, mem_text), ""))
+        self._set_detail("d-stats", (self._stats_block(cpu, mem, cpu_text, mem_text, history), ""))
         self._set_detail("d-update", ("UPDATE ", GRUVBOX_GRAY), (state_text, f"bold {state_color}"))
 
-    def _stats_block(self, cpu: float | None, mem: float | None, cpu_text: str, mem_text: str) -> Text:
+    def _stats_block(
+        self,
+        cpu: float | None,
+        mem: float | None,
+        cpu_text: str,
+        mem_text: str,
+        history: list[tuple[float | None, float | None]] | None = None,
+    ) -> Text:
         text = Text()
         for label, value, display in (("CPU", cpu, cpu_text), ("MEM", mem, mem_text)):
             color = f"bold {self._pct_color(value)}"
@@ -663,6 +736,11 @@ class DockerTUI(App):
             text.append("]  ", style=GRUVBOX_GRAY)
             text.append(display, style=color)
             text.append("\n", style=GRUVBOX_GRAY)
+        history = history or []
+        text.append("HIST ", style=GRUVBOX_GRAY)
+        text.append(self._sparkline([pair[0] for pair in history]), style=GRUVBOX_AQUA)
+        text.append(" / ", style=GRUVBOX_GRAY)
+        text.append(self._sparkline([pair[1] for pair in history]), style=GRUVBOX_YELLOW)
         return text
 
     def _set_detail(self, widget_id: str, *parts) -> None:
@@ -750,6 +828,9 @@ class DockerTUI(App):
             self.push_log("Update cancelled.", GRUVBOX_GRAY)
             return
         cid = container.id
+        if cid in self._updating:
+            self.push_log("Container is already being updated.", GRUVBOX_YELLOW)
+            return
         self._updating.add(cid)
         self._set_upd_cell(cid, "updating")
         self._update_worker(container)
@@ -757,6 +838,10 @@ class DockerTUI(App):
     def _start_update_all(self, targets: list, confirmed: bool) -> None:
         if not confirmed:
             self.push_log("Update-all cancelled.", GRUVBOX_GRAY)
+            return
+        targets = [container for container in targets if container.id not in self._updating]
+        if not targets:
+            self.push_log("All selected containers are already being updated.", GRUVBOX_YELLOW)
             return
         names = ", ".join(self._name_of(c) for c in targets)
         self.push_log(f"Updating {len(targets)} container(s): {names}", f"bold {GRUVBOX_ORANGE}")
@@ -941,6 +1026,10 @@ class DockerTUI(App):
             succeeded = self._do_update(container)
             state = self._update_outcomes.pop(container.id, "up-to-date" if succeeded else "failed")
             if not self._quitting:
+                self.push_log(
+                    f"Update-all: {self._name_of(container)} -> {state}.",
+                    f"bold {GRUVBOX_GREEN if state == 'up-to-date' else GRUVBOX_ORANGE}",
+                )
                 self.call_from_thread(self._apply_update_outcome, self._name_of(container), state)
             if succeeded:
                 ok += 1
@@ -1203,10 +1292,16 @@ class DockerTUI(App):
     def _parse_ports(bindings) -> dict:
         result = {}
         for container_port, rules in (bindings or {}).items():
-            host_ports = [r.get("HostPort") for r in rules or [] if r and r.get("HostPort")]
-            if not host_ports:
+            parsed = []
+            for rule in rules or []:
+                if not rule or not rule.get("HostPort"):
+                    continue
+                host_port = rule["HostPort"]
+                host_ip = rule.get("HostIp")
+                parsed.append((host_ip, host_port) if host_ip else host_port)
+            if not parsed:
                 continue
-            result[container_port] = host_ports if len(host_ports) > 1 else host_ports[0]
+            result[container_port] = parsed if len(parsed) > 1 else parsed[0]
         return result
 
     @staticmethod

@@ -71,13 +71,16 @@ Current progress:
 - Cleared polling flags on unmount and pruned stale metrics after rescans.
 - Added a focused stale-result regression test in `tests/test_app.py`.
 - Added shutdown regression coverage for polling flags.
+- Added duplicate-update guards at both single-update and update-all worker start boundaries.
+- Added headless coverage for retaining selection after rescan and clearing it when the selected container is removed.
+- Added injected update-check and stats worker exception coverage, including stats-loop cleanup after unexpected metadata failures.
 - `python3 -m py_compile app.py tests/test_app.py` passes.
 - `PYTHONPATH=. .venv/bin/python tests/test_app.py` passes.
 - The README now documents isolated environment setup and the working test command.
 
 Remaining:
 
-- Future hardening can expand coverage for injected worker exceptions, duplicate update requests, and selection after rescan.
+- Future hardening can expand coverage as additional worker failure modes are encountered.
 
 ### Relevant files
 
@@ -117,11 +120,12 @@ Current progress:
 - Added preservation for user, hostname, health check, TTY/stdin, privilege, capabilities, devices, DNS, extra hosts, and tmpfs settings.
 - Added focused runtime-configuration assertions for `_build_run_kwargs()`.
 - Added durable `recovered`, `degraded`, and `failed` statuses that survive replacement rescans and appear in the table/details state.
+- Update-all now logs an individual result for every target container.
 - `PYTHONPATH=. .venv/bin/python tests/test_app.py` passes.
 
 Remaining:
 
-- Expand configuration preservation to resource limits, mount edge cases, and unsupported-setting detection.
+- Reconcile this phase to complete after a final review of cleanup and rollback behavior.
 
 ### Relevant files
 
@@ -175,10 +179,12 @@ Current progress:
 - Added read-only `i` inspect action that formats selected-container metadata in the log pane.
 - Added direct JSON-formatting coverage for inspect output.
 - Added confirmed pause and remove lifecycle actions with headless integration coverage.
+- Added bounded CPU and memory resource history with compact detail-panel sparklines.
+- Added direct coverage for history pruning and per-container update-all results.
 
 Remaining:
 
-- Add resource history and richer responsive views.
+- Richer responsive views remain deferred because the installed Textual version rejects the attempted media-query syntax; narrow-terminal behavior still needs manual verification.
 
 ## Phase 4: Configuration Compatibility
 
@@ -220,6 +226,10 @@ Current progress:
 - Preserved the recreatable runtime fields shown by Docker inspect instead of rejecting ordinary containers.
 - Stopped forwarding inspect-only `ConsoleSize` to Docker SDK `containers.run()`.
 - Added regression coverage for the invalid-keyword case.
+- Preserved host IPs and multiple bindings when rebuilding published ports.
+- Added direct coverage for host-IP and multiple-port binding preservation.
+- Added edge-case coverage for colon-containing bind sources and mount options.
+- Added direct coverage for host and `container:` network modes.
 
 Remaining:
 
@@ -260,11 +270,16 @@ Current progress:
 - The documented virtualenv setup and test command pass.
 - The README key map matches the implemented controls.
 - Log history is bounded and follow mode stops during shutdown.
+- Docker daemon list failures preserve the last successful container view and expose a retryable unavailable state.
+- Registry lookup failures are reported as `registry-error`, distinct from current, update-available, and local-only states.
+- Added fake-client coverage for daemon disconnects and registry outages.
+- Stats and registry polling intervals are configurable through `DOCKPIT_STATS_INTERVAL` and `DOCKPIT_REGISTRY_INTERVAL`, defaulting to 2 and 60 seconds.
+- Resource history and per-container update-all results are covered by headless tests.
+- `PYTHONPATH=. .venv/bin/python tests/test_app.py` passes.
 
 Remaining:
 
-- Verify behavior against daemon disconnects and registry outages.
-- Consider making polling intervals configurable.
+- Continue broader operational verification as new Docker failure modes are encountered.
 
 ## Later Feature Backlog
 

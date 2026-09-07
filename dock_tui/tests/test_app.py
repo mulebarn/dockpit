@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime, timezone
 
 import docker.errors
@@ -150,6 +151,9 @@ class FakeImages:
         return image
 
     def get_registry_data(self, name, auth_config=None):
+        if self._client._fail_registry_count:
+            self._client._fail_registry_count -= 1
+            raise docker.errors.APIError("fake registry outage", explanation="fake")
         ref = name.split("@", 1)[0]
         image = next((i for i in self._client._images if i.ref == ref), None)
         if image is None:
@@ -174,6 +178,9 @@ class FakeContainers:
         self._client = client
 
     def list(self, all=True):
+        if self._client._fail_list_count:
+            self._client._fail_list_count -= 1
+            raise docker.errors.APIError("fake daemon disconnect", explanation="fake")
         return [c for c in self._client._containers if not c._removed]
 
     def run(self, **kwargs):
@@ -204,6 +211,8 @@ class FakeDockerClient:
         self._fail_stop_count = 0
         self._fail_remove_count = 0
         self._fail_network_count = 0
+        self._fail_registry_count = 0
+        self._fail_list_count = 0
         self.containers = FakeContainers(self)
         self.images = FakeImages(self)
         self.networks = FakeNetworks(self)
@@ -241,6 +250,198 @@ def test_stale_worker_results_are_ignored():
     assert app._update_status == {}
     assert not app._stats_in_flight
     assert not app._check_in_flight
+
+
+def test_polling_intervals_accept_positive_values_and_reject_invalid_values():
+    original_stats = os.environ.get("DOCKPIT_STATS_INTERVAL")
+    original_registry = os.environ.get("DOCKPIT_REGISTRY_INTERVAL")
+    try:
+        os.environ["DOCKPIT_STATS_INTERVAL"] = "0.5"
+        os.environ["DOCKPIT_REGISTRY_INTERVAL"] = "15"
+        app = DockerTUI()
+        assert app._stats_interval == 0.5
+        assert app._registry_interval == 15.0
+
+        os.environ["DOCKPIT_STATS_INTERVAL"] = "invalid"
+        os.environ["DOCKPIT_REGISTRY_INTERVAL"] = "0"
+        app = DockerTUI()
+        assert app._stats_interval == app_module.DEFAULT_STATS_INTERVAL
+        assert app._registry_interval == app_module.DEFAULT_REGISTRY_INTERVAL
+    finally:
+        for name, value in (
+            ("DOCKPIT_STATS_INTERVAL", original_stats),
+            ("DOCKPIT_REGISTRY_INTERVAL", original_registry),
+        ):
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def test_resource_sparkline_and_history_are_bounded():
+    app = DockerTUI()
+    for index in range(app_module.MAX_RESOURCE_HISTORY + 5):
+        app._apply_stats({"id_web": (float(index), float(100 - index))})
+
+    history = app._resource_history["id_web"]
+    assert len(history) == app_module.MAX_RESOURCE_HISTORY
+    assert history[0] == (5.0, 95.0)
+    sparkline = app._sparkline([pair[0] for pair in history])
+    assert len(sparkline) == 12
+    assert sparkline[-1] != "\u00b7"
+
+
+def test_update_start_rejects_duplicate_requests():
+    client = make_client()
+    app = DockerTUI()
+    app.client = client
+    web = next(c for c in client._containers if c.name == "/web")
+    calls = []
+    app._update_worker = calls.append
+    app._updating.add(web.id)
+
+    app._start_update(web, True)
+
+    assert calls == []
+
+
+def test_update_all_skips_containers_that_became_busy():
+    client = make_client()
+    app = DockerTUI()
+    app.client = client
+    web, util = client._containers
+    calls = []
+    app._update_all_worker = calls.append
+    app._updating.add(web.id)
+
+    app._start_update_all([web, util], True)
+
+    assert calls == [[util]]
+    assert util.id in app._updating
+    assert web.id in app._updating
+
+
+def test_registry_failure_is_distinct_from_unknown_or_current():
+    client = make_client()
+    client._fail_registry_count = 1
+    app = DockerTUI()
+    app.client = client
+    web = next(c for c in client._containers if c.name == "/web")
+
+    assert app._check_update(web) == "registry-error"
+    assert app._check_update(web) == "update"
+
+
+async def test_scan_failure_preserves_existing_container_view():
+    state = {"client": None}
+
+    def from_env(*args, **kwargs):
+        if state["client"] is None:
+            state["client"] = make_client()
+        return state["client"]
+
+    app_module.docker.from_env = from_env
+    app = DockerTUI()
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause(0.4)
+        client = state["client"]
+        client._fail_list_count = 1
+        app.action_rescan()
+        await pilot.pause(0.4)
+
+        assert app._docker_state == "unavailable"
+        assert app.table.row_count == 2
+        assert sorted(app._container_by_key) == ["id_util", "id_web"]
+
+
+async def test_rescan_preserves_selection_and_clears_removed_selection():
+    state = {"client": None}
+
+    def from_env(*args, **kwargs):
+        if state["client"] is None:
+            state["client"] = make_client()
+        return state["client"]
+
+    app_module.docker.from_env = from_env
+    app = DockerTUI()
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause(0.4)
+        app._selected_id = "id_util"
+        app.action_rescan()
+        await pilot.pause(0.4)
+        assert app._selected_id == "id_util"
+
+        util = next(c for c in state["client"]._containers if c.id == "id_util")
+        util._removed = True
+        app.action_rescan()
+        await pilot.pause(0.4)
+        assert app._selected_id == "id_web"
+
+
+async def test_worker_exceptions_clear_in_flight_flags():
+    state = {"client": None}
+
+    def from_env(*args, **kwargs):
+        if state["client"] is None:
+            state["client"] = make_client()
+        return state["client"]
+
+    app_module.docker.from_env = from_env
+    app = DockerTUI()
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause(0.4)
+
+        app._check_in_flight = True
+
+        def raise_check(_container):
+            raise RuntimeError("injected update-check failure")
+
+        app._check_update = raise_check
+        app._update_check_worker(app._scan_generation)
+        await pilot.pause(0.3)
+        assert not app._check_in_flight
+
+        class ExplodingStatus:
+            id = "exploding"
+
+            @property
+            def status(self):
+                raise RuntimeError("injected stats failure")
+
+        app._container_by_key = {"exploding": ExplodingStatus()}
+        app._refresh_header = lambda: None
+        app._stats_in_flight = True
+        app._stats_worker(app._scan_generation)
+        await pilot.pause(0.3)
+        assert not app._stats_in_flight
+
+
+async def test_update_all_logs_each_container_result():
+    state = {"client": None}
+
+    def from_env(*args, **kwargs):
+        if state["client"] is None:
+            state["client"] = make_client()
+        return state["client"]
+
+    app_module.docker.from_env = from_env
+    app = DockerTUI()
+    async with app.run_test(size=(140, 44)) as pilot:
+        await pilot.pause(0.4)
+        web, util = state["client"]._containers
+
+        def fake_update(container):
+            state = "up-to-date" if container is web else "failed"
+            app._update_outcomes[container.id] = state
+            return state == "up-to-date"
+
+        app._do_update = fake_update
+        app._update_all_worker([web, util])
+        await pilot.pause(0.4)
+        messages = [message for message, _style in app._log_history]
+
+        assert "Update-all: web -> up-to-date." in messages
+        assert "Update-all: util -> failed." in messages
 
 
 def test_container_filter_matches_name_image_and_status():
@@ -379,6 +580,52 @@ def test_build_run_kwargs_preserves_runtime_settings():
     assert kwargs["dns"] == ["1.1.1.1"]
     assert kwargs["extra_hosts"]["host.docker.internal"] == "host-gateway"
     assert kwargs["tmpfs"]["/run"] == "rw,noexec"
+
+
+def test_parse_ports_preserves_host_ips_and_multiple_bindings():
+    assert DockerTUI._parse_ports(
+        {
+            "80/tcp": [
+                {"HostIp": "127.0.0.1", "HostPort": "8080"},
+                {"HostIp": "192.168.1.10", "HostPort": "18080"},
+            ],
+            "443/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8443"}],
+        }
+    ) == {
+        "80/tcp": [("127.0.0.1", "8080"), ("192.168.1.10", "18080")],
+        "443/tcp": ("0.0.0.0", "8443"),
+    }
+
+
+def test_parse_binds_preserves_colons_and_mount_options():
+    assert DockerTUI._parse_binds(
+        [
+            "/srv/data:with-colon:/data:ro,z",
+            "/srv/cache:/cache",
+            "/invalid-bind",
+        ]
+    ) == {
+        "/srv/data:with-colon": {"bind": "/data", "mode": "ro,z"},
+        "/srv/cache": {"bind": "/cache", "mode": "rw"},
+    }
+
+
+def test_build_run_kwargs_preserves_host_and_container_network_modes():
+    app = DockerTUI()
+    attrs = make_client()._containers[0].attrs
+
+    attrs["HostConfig"]["NetworkMode"] = "host"
+    kwargs, secondary = app._build_run_kwargs(attrs)
+    assert kwargs["network_mode"] == "host"
+    assert secondary == {}
+
+    attrs["HostConfig"]["NetworkMode"] = "container:other"
+    attrs["NetworkSettings"]["Networks"] = {
+        "bridge": {"Aliases": ["web"]},
+    }
+    kwargs, secondary = app._build_run_kwargs(attrs)
+    assert kwargs["network_mode"] == "container:other"
+    assert secondary == {}
 
 
 def test_log_output_decodes_bytes_and_preserves_lines():
@@ -647,10 +894,15 @@ async def run_main():
 
 if __name__ == "__main__":
     test_stale_worker_results_are_ignored()
+    test_registry_failure_is_distinct_from_unknown_or_current()
     test_unmount_clears_worker_flags()
     test_update_recovers_after_recreate_failure()
     test_update_failure_policies()
     test_build_run_kwargs_preserves_runtime_settings()
     asyncio.run(test_stats_none_pair_regressions())
+    asyncio.run(test_scan_failure_preserves_existing_container_view())
+    asyncio.run(test_rescan_preserves_selection_and_clears_removed_selection())
+    asyncio.run(test_worker_exceptions_clear_in_flight_flags())
+    asyncio.run(test_update_all_logs_each_container_result())
     asyncio.run(run_main())
     asyncio.run(test_update_preserves_compose_config())
