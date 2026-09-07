@@ -1,5 +1,6 @@
 import asyncio
 import os
+from unittest.mock import patch
 import time
 from datetime import datetime, timezone
 
@@ -501,6 +502,32 @@ def test_detail_metadata_formats_ctop_style_runtime_information():
     assert "oom" in app._format_runtime(container.attrs)
 
 
+def test_compose_groups_collapse_and_use_project_update_commands():
+    client = make_client()
+    web, util = client._containers
+    labels = {
+        "com.docker.compose.project": "immich",
+        "com.docker.compose.project.working_dir": "/tmp",
+        "com.docker.compose.project.config_files": "/tmp/compose.yml",
+    }
+    web.attrs["Config"]["Labels"] = labels
+    util.attrs["Config"]["Labels"] = labels
+    app = DockerTUI()
+    app.client = client
+    app._all_containers = [web, util]
+    assert len(app._collapsed_group_containers([web, util])) == 1
+    app._updating.add(web.id)
+    calls = []
+    with patch.object(app_module.shutil, "which", return_value="/usr/bin/docker"), patch.object(
+        app_module.os.path, "isdir", return_value=True
+    ), patch.object(app_module.subprocess, "run", side_effect=lambda command, **kwargs: calls.append(command)):
+        assert app._do_compose_update(web, app._compose_context(web.attrs))
+    assert calls[0][-1] == "pull"
+    assert calls[1][-2:] == ["up", "-d"]
+    assert calls[2][-3:] == ["image", "prune", "-f"]
+    assert web.id not in app._updating
+
+
 def test_update_display_includes_staged_states():
     assert {"pulling", "stopping", "removing", "recreating", "restoring"}.issubset(
         app_module.UPDATE_DISPLAY
@@ -938,5 +965,6 @@ if __name__ == "__main__":
     asyncio.run(test_worker_exceptions_clear_in_flight_flags())
     asyncio.run(test_update_all_logs_each_container_result())
     test_detail_metadata_formats_ctop_style_runtime_information()
+    test_compose_groups_collapse_and_use_project_update_commands()
     asyncio.run(run_main())
     asyncio.run(test_update_preserves_compose_config())

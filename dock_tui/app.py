@@ -2,6 +2,8 @@
 
 import json
 import os
+import shutil
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -453,6 +455,8 @@ class DockerTUI(App):
         if remember:
             self._all_containers = list(containers)
         containers = [container for container in containers if self._matches_filter(container)]
+        if not self._groups_expanded:
+            containers = self._collapsed_group_containers(containers)
         prev_selected = self._selected_id if self._selected_id in self._container_by_key else None
         self._container_by_key.clear()
         self._update_status.clear()
@@ -500,10 +504,12 @@ class DockerTUI(App):
 
     def action_expand_groups(self) -> None:
         self._groups_expanded = True
+        self._populate_table(self._all_containers, remember=False)
         self.push_log("Container groups expanded.", GRUVBOX_GRAY)
 
     def action_collapse_groups(self) -> None:
         self._groups_expanded = False
+        self._populate_table(self._all_containers, remember=False)
         self.push_log("Container groups collapsed; actionable containers remain visible.", GRUVBOX_GRAY)
 
     def action_show_registry_settings(self) -> None:
@@ -540,6 +546,35 @@ class DockerTUI(App):
         haystack = f"{name} {image} {status}".lower()
         return self._filter_text in haystack
 
+    @staticmethod
+    def _compose_group(container) -> str | None:
+        labels = ((container.attrs.get("Config") or {}).get("Labels") or {})
+        return labels.get("com.docker.compose.project")
+
+    def _collapsed_group_containers(self, containers: list) -> list:
+        representatives = []
+        seen = set()
+        for container in containers:
+            group = self._compose_group(container)
+            key = group or f"container:{container.id}"
+            if key not in seen:
+                seen.add(key)
+                representatives.append(container)
+        return representatives
+
+    @staticmethod
+    def _compose_context(attrs: dict) -> dict | None:
+        labels = ((attrs.get("Config") or {}).get("Labels") or {})
+        project = labels.get("com.docker.compose.project")
+        workdir = labels.get("com.docker.compose.project.working_dir")
+        config_files = labels.get("com.docker.compose.project.config_files")
+        if not project or not workdir or not config_files or not os.path.isdir(workdir):
+            return None
+        files = [item.strip() for item in config_files.split(",") if item.strip()]
+        if not files:
+            return None
+        return {"project": project, "workdir": workdir, "files": files}
+
     def _needs_attention(self, container) -> bool:
         status = container.status or ""
         health = ((container.attrs.get("State") or {}).get("Health") or {}).get("Status")
@@ -559,6 +594,10 @@ class DockerTUI(App):
     def _add_row(self, container) -> None:
         attrs = container.attrs
         name = (container.name or container.id).lstrip("/")
+        group = self._compose_group(container)
+        if group and not self._groups_expanded:
+            member_count = sum(1 for candidate in self._all_containers if self._compose_group(candidate) == group)
+            name = f"{group} [{member_count}]"
         image = self._format_image(attrs, container)
         status = container.status or (attrs.get("State") or {}).get("Status") or "unknown"
         status_label = self._status_cell(status)
@@ -1196,6 +1235,7 @@ class DockerTUI(App):
             for cid, container in self._container_by_key.items()
             if self._update_status.get(cid) == "update"
         ]
+        targets = self._dedupe_update_targets(targets)
         if not targets:
             self.push_log("No containers with available updates.", GRUVBOX_YELLOW)
             return
@@ -1204,6 +1244,18 @@ class DockerTUI(App):
             f"Update {len(targets)} container(s): {names}?",
             lambda confirmed: self._start_update_all(targets, confirmed),
         )
+
+    def _dedupe_update_targets(self, targets: list) -> list:
+        result = []
+        seen = set()
+        for container in targets:
+            context = self._compose_context(container.attrs)
+            key = ("compose", context["project"]) if context else ("container", container.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(container)
+        return result
 
     def _confirm_action(self, message: str, callback) -> None:
         self.push_screen(ConfirmScreen(message), callback)
@@ -1452,6 +1504,9 @@ class DockerTUI(App):
     def _do_update(self, container) -> bool:
         cid = container.id
         name = self._name_of(container)
+        compose_context = self._compose_context(container.attrs)
+        if compose_context is not None:
+            return self._do_compose_update(container, compose_context)
         removed = False
         degraded = False
         run_kwargs = None
@@ -1538,6 +1593,52 @@ class DockerTUI(App):
             return False
         finally:
             self._updating.discard(cid)
+
+    def _do_compose_update(self, container, context: dict) -> bool:
+        name = self._name_of(container)
+        project = context["project"]
+        compose = shutil.which("docker")
+        if compose is None:
+            self.push_log("Docker CLI not found; cannot run Compose update.", GRUVBOX_RED)
+            self._update_outcomes[container.id] = "failed"
+            return False
+        command = [compose, "compose", "-p", project]
+        for config_file in context["files"]:
+            command.extend(("-f", config_file))
+        try:
+            self.push_log(f"== Updating Compose project '{project}' ({name}) ==", f"bold {GRUVBOX_YELLOW}")
+            self._publish_update_stage(name, "pulling")
+            self.push_log("Running docker compose pull…", GRUVBOX_ORANGE)
+            self._run_compose_command(command + ["pull"], context["workdir"])
+            self._publish_update_stage(name, "recreating")
+            self.push_log("Running docker compose up -d…", GRUVBOX_ORANGE)
+            self._run_compose_command(command + ["up", "-d"], context["workdir"])
+            self.push_log("Pruning unused images…", GRUVBOX_ORANGE)
+            subprocess.run(
+                [compose, "image", "prune", "-f"],
+                cwd=context["workdir"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self._update_outcomes[container.id] = "up-to-date"
+            self.push_log(f"Compose project '{project}' updated successfully.", f"bold {GRUVBOX_GREEN}")
+            return True
+        except subprocess.CalledProcessError as exc:
+            output = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()[-1]
+            self._update_outcomes[container.id] = "failed"
+            self.push_log(f"Compose update failed for '{project}': {output}", f"bold {GRUVBOX_RED}")
+            return False
+        except Exception as exc:
+            self._update_outcomes[container.id] = "failed"
+            self.push_log(f"Compose update failed for '{project}': {exc}", f"bold {GRUVBOX_RED}")
+            return False
+        finally:
+            self._updating.discard(container.id)
+
+    @staticmethod
+    def _run_compose_command(command: list[str], workdir: str) -> None:
+        subprocess.run(command, cwd=workdir, check=True, capture_output=True, text=True)
 
     def _build_run_kwargs(self, attrs: dict) -> tuple[dict, dict]:
         config = attrs.get("Config") or {}

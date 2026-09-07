@@ -15,6 +15,7 @@ A terminal user interface for managing Docker containers — vintage retro palet
 - Configurable polling intervals via `DOCKPIT_STATS_INTERVAL` (default: 2s) and `DOCKPIT_REGISTRY_INTERVAL` (default: 60s), plus image-result caching via `DOCKPIT_REGISTRY_CACHE_TTL` (default: 15m)
 - Update in place: pull latest image → stop → remove → recreate with saved env, ports, volumes, restart policy, and network mode
 - Update-all applies pending updates to every flagged container
+- Compose-managed projects are grouped by `com.docker.compose.project`; updating one service updates the project with `docker compose pull`, `docker compose up -d`, then `docker image prune -f`
 - ctop-style container details include live CPU/MEM gauges, rolling history and peaks, image digest, lifecycle/exit information, restart count, health failures, networks and IPs, ports, commands, mounts, resource limits, and update state
 
 ## Usage
@@ -54,6 +55,8 @@ python app.py
 The table shows color-coded CPU and memory micro-bars, explicit health state, and update state. The selected row uses a high-contrast inverse treatment. The details panel also shows image, restart policy, age, start time, networks, volume count, and resource history.
 
 The footer keeps only the high-frequency actions visible. Press `ctrl+p` to open the Command Palette for the complete action set, including lifecycle actions, updates, Attention Mode, group commands, log views, filters, inspection, refresh, and registry settings. Palette search accepts descriptive keywords and aliases such as `start`, `upgrade`, `attention`, `tail`, and `settings`.
+
+Compose grouping uses Docker's project labels. Collapse groups to see one row per Compose project, with the service count in brackets; expand groups to see each container. Project-level updates require Docker Compose labels for the project name, working directory, and config files. Containers without that metadata continue to use the individual inspect-and-recreate update path.
 
 Update, update-all, and stop actions show a confirmation dialog. Press `Enter` or `y` to confirm, or `Esc` or `n` to cancel.
 
