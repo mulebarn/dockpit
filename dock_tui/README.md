@@ -15,7 +15,7 @@ A terminal user interface for managing Docker containers — vintage retro palet
 - Configurable polling intervals via `DOCKPIT_STATS_INTERVAL` (default: 2s) and `DOCKPIT_REGISTRY_INTERVAL` (default: 60s), plus image-result caching via `DOCKPIT_REGISTRY_CACHE_TTL` (default: 15m)
 - Update in place: pull latest image → stop → remove → recreate with saved env, ports, volumes, restart policy, and network mode
 - Update-all applies pending updates to every flagged container
-- Container details include bounded CPU and memory history sparklines
+- ctop-style container details include live CPU/MEM gauges, rolling history and peaks, image digest, lifecycle/exit information, restart count, health failures, networks and IPs, ports, commands, mounts, resource limits, and update state
 
 ## Usage
 

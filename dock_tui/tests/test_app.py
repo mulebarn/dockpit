@@ -484,6 +484,23 @@ def test_health_and_restart_metadata_display():
     assert app._health_display(attrs)[0] == "\u2716 unhealthy"
 
 
+def test_detail_metadata_formats_ctop_style_runtime_information():
+    app = DockerTUI()
+    container = make_client()._containers[0]
+    container.attrs.setdefault("State", {}).update({"Status": "exited", "ExitCode": 137, "Error": "oom"})
+    container.attrs["RestartCount"] = 3
+    container.attrs["HostConfig"]["Memory"] = 2 * 1024 ** 3
+    container.attrs["HostConfig"]["NanoCpus"] = 500_000_000
+    container.attrs["NetworkSettings"]["Networks"] = {
+        "bridge": {"IPAddress": "172.17.0.4"}
+    }
+    assert "exit 137" in app._format_runtime(container.attrs)
+    assert "restarts 3" in app._format_runtime(container.attrs)
+    assert app._format_limits(container.attrs) == "MEM 2.0G  CPU 0.50"
+    assert app._format_networks(container.attrs) == "bridge (172.17.0.4)"
+    assert "oom" in app._format_runtime(container.attrs)
+
+
 def test_update_display_includes_staged_states():
     assert {"pulling", "stopping", "removing", "recreating", "restoring"}.issubset(
         app_module.UPDATE_DISPLAY
@@ -920,5 +937,6 @@ if __name__ == "__main__":
     asyncio.run(test_rescan_preserves_selection_and_clears_removed_selection())
     asyncio.run(test_worker_exceptions_clear_in_flight_flags())
     asyncio.run(test_update_all_logs_each_container_result())
+    test_detail_metadata_formats_ctop_style_runtime_information()
     asyncio.run(run_main())
     asyncio.run(test_update_preserves_compose_config())

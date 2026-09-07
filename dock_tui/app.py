@@ -96,6 +96,10 @@ DETAIL_IDS = (
     "d-restart-time",
     "d-network",
     "d-volumes",
+    "d-command",
+    "d-runtime",
+    "d-mounts",
+    "d-limits",
 )
 
 HEALTH_DISPLAY = {
@@ -291,6 +295,10 @@ class DockerTUI(App):
                 Static("", id="d-restart-time", classes="detail-row"),
                 Static("", id="d-network", classes="detail-row"),
                 Static("", id="d-volumes", classes="detail-row"),
+                Static("", id="d-command", classes="detail-row"),
+                Static("", id="d-runtime", classes="detail-row"),
+                Static("", id="d-mounts", classes="detail-row"),
+                Static("", id="d-limits", classes="detail-row"),
                 id="details",
             ),
             id="main",
@@ -551,7 +559,7 @@ class DockerTUI(App):
     def _add_row(self, container) -> None:
         attrs = container.attrs
         name = (container.name or container.id).lstrip("/")
-        image = (attrs.get("Config") or {}).get("Image") or "?"
+        image = self._format_image(attrs, container)
         status = container.status or (attrs.get("State") or {}).get("Status") or "unknown"
         status_label = self._status_cell(status)
         health_label, health_color = self._health_display(attrs)
@@ -986,18 +994,30 @@ class DockerTUI(App):
             ("STATUS ", GRUVBOX_GRAY),
             (status_label, f"bold {status_color}"),
         )
-        self._set_detail("d-health", ("HEALTH ", GRUVBOX_GRAY), (health_text, f"bold {health_color}"))
+        self._set_detail(
+            "d-health",
+            ("HEALTH ", GRUVBOX_GRAY),
+            (self._format_health(attrs, health_text), f"bold {health_color}"),
+        )
         self._set_detail("d-restart", ("RESTART", GRUVBOX_GRAY), (restart, GRUVBOX_FG))
         self._set_detail("d-created", ("UP     ", GRUVBOX_GRAY), (self._fmt_created(created), GRUVBOX_FG))
         self._set_detail("d-ports", ("PORTS  ", GRUVBOX_GRAY), (ports, GRUVBOX_FG))
         self._set_detail("d-stats", (self._stats_block(cpu, mem, cpu_text, mem_text, history), ""))
         self._set_detail("d-update", ("UPDATE ", GRUVBOX_GRAY), (state_text, f"bold {state_color}"))
         restart_time = ((attrs.get("State") or {}).get("StartedAt") or "")
-        networks = ", ".join(sorted((attrs.get("NetworkSettings") or {}).get("Networks") or {})) or "none"
+        networks = self._format_networks(attrs)
         volume_count = len(attrs.get("Mounts") or [])
         self._set_detail("d-restart-time", ("STARTED", GRUVBOX_GRAY), (self._fmt_created(restart_time), GRUVBOX_FG))
         self._set_detail("d-network", ("NETWORK", GRUVBOX_GRAY), (networks, GRUVBOX_FG))
         self._set_detail("d-volumes", ("VOLUMES", GRUVBOX_GRAY), (str(volume_count), GRUVBOX_FG))
+        command = self._format_command(attrs)
+        runtime = self._format_runtime(attrs)
+        mounts = self._format_mounts(attrs)
+        limits = self._format_limits(attrs)
+        self._set_detail("d-command", ("COMMAND", GRUVBOX_GRAY), (command, GRUVBOX_FG))
+        self._set_detail("d-runtime", ("RUNTIME", GRUVBOX_GRAY), (runtime, GRUVBOX_FG))
+        self._set_detail("d-mounts", ("MOUNTS ", GRUVBOX_GRAY), (mounts, GRUVBOX_FG))
+        self._set_detail("d-limits", ("LIMITS ", GRUVBOX_GRAY), (limits, GRUVBOX_FG))
 
     def _stats_block(
         self,
@@ -1020,7 +1040,93 @@ class DockerTUI(App):
         text.append(self._sparkline([pair[0] for pair in history]), style=GRUVBOX_AQUA)
         text.append(" / ", style=GRUVBOX_GRAY)
         text.append(self._sparkline([pair[1] for pair in history]), style=GRUVBOX_YELLOW)
+        if history:
+            cpu_samples = [pair[0] for pair in history if pair[0] is not None]
+            mem_samples = [pair[1] for pair in history if pair[1] is not None]
+            text.append("\nPEAK ", style=GRUVBOX_GRAY)
+            text.append(
+                f"CPU {self._format_pct(max(cpu_samples)) if cpu_samples else '--'}  "
+                f"MEM {self._format_pct(max(mem_samples)) if mem_samples else '--'}  "
+                f"({len(history)} samples)",
+                style=GRUVBOX_FG,
+            )
         return text
+
+    @staticmethod
+    def _format_command(attrs: dict) -> str:
+        config = attrs.get("Config") or {}
+        entrypoint = config.get("Entrypoint") or ""
+        command = config.get("Cmd") or []
+        if isinstance(entrypoint, list):
+            parts = entrypoint + command
+        else:
+            parts = ([entrypoint] if entrypoint else []) + (command if isinstance(command, list) else [command])
+        return " ".join(str(part) for part in parts).strip() or "none"
+
+    @staticmethod
+    def _format_image(attrs: dict, container) -> str:
+        image_ref = (attrs.get("Config") or {}).get("Image") or "?"
+        image = getattr(container, "image", None)
+        digests = (getattr(image, "attrs", None) or {}).get("RepoDigests") or []
+        digest = digests[0].split("@", 1)[-1] if digests else ""
+        return f"{image_ref} @ {digest[:19]}" if digest.startswith("sha256:") else image_ref
+
+    @staticmethod
+    def _format_health(attrs: dict, health_text: str) -> str:
+        health = ((attrs.get("State") or {}).get("Health") or {})
+        failures = health.get("FailingStreak") or 0
+        return f"{health_text} | failures {failures}" if failures else health_text
+
+    @staticmethod
+    def _format_networks(attrs: dict) -> str:
+        networks = (attrs.get("NetworkSettings") or {}).get("Networks") or {}
+        if not networks:
+            return "none"
+        values = []
+        for name, data in sorted(networks.items()):
+            address = (data or {}).get("IPAddress") or "-"
+            values.append(f"{name} ({address})")
+        return ", ".join(values)
+
+    @staticmethod
+    def _format_runtime(attrs: dict) -> str:
+        state = attrs.get("State") or {}
+        status = state.get("Status") or "unknown"
+        exit_code = state.get("ExitCode")
+        error = state.get("Error") or ""
+        restart_count = attrs.get("RestartCount", 0)
+        result = f"{status} | restarts {restart_count}"
+        if exit_code not in (None, 0):
+            result += f" | exit {exit_code}"
+        if error:
+            result += f" | {error}"
+        return result
+
+    @staticmethod
+    def _format_mounts(attrs: dict) -> str:
+        mounts = attrs.get("Mounts") or []
+        if not mounts:
+            binds = (attrs.get("HostConfig") or {}).get("Binds") or []
+            return ", ".join(str(bind).split(":", 1)[0] for bind in binds) or "none"
+        values = []
+        for mount in mounts:
+            source = mount.get("Source") or mount.get("Name") or "?"
+            destination = mount.get("Destination") or "?"
+            mode = "ro" if mount.get("RW") is False else "rw"
+            values.append(f"{source}->{destination} ({mode})")
+        return ", ".join(values)
+
+    @staticmethod
+    def _format_limits(attrs: dict) -> str:
+        host = attrs.get("HostConfig") or {}
+        memory = host.get("Memory") or 0
+        nano_cpus = host.get("NanoCpus") or 0
+        parts = []
+        if memory:
+            parts.append(f"MEM {memory / (1024 ** 3):.1f}G")
+        if nano_cpus:
+            parts.append(f"CPU {nano_cpus / 1_000_000_000:.2f}")
+        return "  ".join(parts) or "unlimited"
 
     def _set_detail(self, widget_id: str, *parts) -> None:
         text = Text()
